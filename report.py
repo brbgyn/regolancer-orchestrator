@@ -42,8 +42,9 @@ def count_orchestrator_rebalances():
 # =========================
 # NODE TOTAL (LNDg)
 # =========================
+
 def count_node_rebalances():
-    url = f"{LNDG_BASE_URL}/api/rebalancer/?status=success"
+    url = f"{LNDG_BASE_URL}/api/rebalancer/"
     auth = (LNDG_USER, LNDG_PASS)
     total = 0
 
@@ -53,6 +54,9 @@ def count_node_rebalances():
         data = r.json()
 
         for rb in data.get("results", []):
+            if rb.get("status") != "success":
+                continue
+
             ts = rb.get("created_at") or ""
             if ts.startswith(TODAY):
                 total += 1
