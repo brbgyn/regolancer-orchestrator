@@ -1,7 +1,11 @@
 import csv
 import os
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, date
+
+def parse_lndg_datetime(s):
+    # Exemplo: "2026/01/09 09:25:35"
+    return datetime.strptime(s, "%Y/%m/%d %H:%M:%S").date()
 
 try:
     from dotenv import load_dotenv
@@ -19,7 +23,7 @@ LNDG_BASE_URL = os.getenv("LNDG_BASE_URL")
 LNDG_USER = os.getenv("LNDG_USER")
 LNDG_PASS = os.getenv("LNDG_PASS")
 
-TODAY = datetime.now(timezone.utc).date().isoformat()
+TODAY = date.today()
 
 # =========================
 # ORCHESTRATOR COUNT
@@ -35,7 +39,12 @@ def count_orchestrator_rebalances():
             if not row:
                 continue
             ts = row[0]
-            if ts.startswith(TODAY):
+            try:
+                csv_date = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S").date()
+            except Exception:
+                continue
+
+            if csv_date == TODAY:
                 count += 1
     return count
 
@@ -56,10 +65,18 @@ def count_node_rebalances():
         stop = False
 
         for rb in data.get("results", []):
-            ts = rb.get("created_at") or ""
-            if not ts.startswith(TODAY):
+            ts = rb.get("created_at")
+            if not ts:
+                continue
+
+            rb_date = parse_lndg_datetime(ts)
+
+            if rb_date < TODAY:
                 stop = True
                 break
+
+            if rb_date == TODAY and rb.get("status") == "success":
+                total += 1
 
             if rb.get("status") == "success":
                 total += 1
