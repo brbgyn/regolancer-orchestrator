@@ -53,13 +53,19 @@ def count_node_rebalances():
         r.raise_for_status()
         data = r.json()
 
-        for rb in data.get("results", []):
-            if rb.get("status") != "success":
-                continue
+        stop = False
 
+        for rb in data.get("results", []):
             ts = rb.get("created_at") or ""
-            if ts.startswith(TODAY):
+            if not ts.startswith(TODAY):
+                stop = True
+                break
+
+            if rb.get("status") == "success":
                 total += 1
+
+        if stop:
+            break
 
         url = data.get("next")
 
