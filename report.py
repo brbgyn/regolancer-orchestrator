@@ -58,7 +58,7 @@ def count_node_rebalances():
 
     total = 0
     pages = 0
-    MAX_PAGES = 3   # ajuste se quiser (3 já é mais que suficiente)
+    MAX_PAGES = 3
 
     while url and pages < MAX_PAGES:
         pages += 1
@@ -68,16 +68,7 @@ def count_node_rebalances():
         data = r.json()
 
         for rb in data.get("results", []):
-            ts = rb.get("created_at")
-            if not ts:
-                continue
-
-            try:
-                rb_date = datetime.strptime(ts, "%Y/%m/%d %H:%M:%S").date()
-            except Exception:
-                continue
-
-            if rb_date == TODAY and rb.get("status") == "success":
+            if rb.get("status") == "success":
                 total += 1
 
         url = data.get("next")
@@ -90,10 +81,14 @@ def count_node_rebalances():
 def report_already_written():
     if not os.path.exists(DAILY_REPORT_CSV):
         return False
+
+    today = date.today().isoformat()
+
     with open(DAILY_REPORT_CSV) as f:
         reader = csv.reader(f)
+        next(reader, None)
         for row in reader:
-            if row and row[0] == TODAY:
+            if row and row[0] == today:
                 return True
     return False
 
