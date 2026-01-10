@@ -68,7 +68,7 @@ def count_node_rebalances():
         data = r.json()
 
         for rb in data.get("results", []):
-            if rb.get("status") == "success":
+            if rb.get("status") == 4:   # ✅ SUCCESS
                 total += 1
 
         url = data.get("next")
