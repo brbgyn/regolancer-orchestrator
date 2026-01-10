@@ -55,34 +55,30 @@ def count_orchestrator_rebalances():
 def count_node_rebalances():
     url = f"{LNDG_BASE_URL}/api/rebalancer/"
     auth = (LNDG_USER, LNDG_PASS)
-    total = 0
 
-    while url:
+    total = 0
+    pages = 0
+    MAX_PAGES = 3   # ajuste se quiser (3 já é mais que suficiente)
+
+    while url and pages < MAX_PAGES:
+        pages += 1
+
         r = requests.get(url, auth=auth, timeout=10)
         r.raise_for_status()
         data = r.json()
-
-        stop = False
 
         for rb in data.get("results", []):
             ts = rb.get("created_at")
             if not ts:
                 continue
 
-            rb_date = parse_lndg_datetime(ts)
-
-            if rb_date < TODAY:
-                stop = True
-                break
+            try:
+                rb_date = datetime.strptime(ts, "%Y/%m/%d %H:%M:%S").date()
+            except Exception:
+                continue
 
             if rb_date == TODAY and rb.get("status") == "success":
                 total += 1
-
-            if rb.get("status") == "success":
-                total += 1
-
-        if stop:
-            break
 
         url = data.get("next")
 
