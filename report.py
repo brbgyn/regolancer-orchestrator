@@ -3,6 +3,12 @@ import os
 import requests
 from datetime import datetime, timezone
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # =========================
 # CONFIG
 # =========================
@@ -37,7 +43,7 @@ def count_orchestrator_rebalances():
 # NODE TOTAL (LNDg)
 # =========================
 def count_node_rebalances():
-    url = f"{LNDG_BASE_URL}/api/rebalances/?status=success"
+    url = f"{LNDG_BASE_URL}/api/rebalancer/?status=success"
     auth = (LNDG_USER, LNDG_PASS)
     total = 0
 
@@ -45,14 +51,16 @@ def count_node_rebalances():
         r = requests.get(url, auth=auth, timeout=10)
         r.raise_for_status()
         data = r.json()
-        for rb in data["results"]:
+
+        for rb in data.get("results", []):
             ts = rb.get("created_at") or ""
             if ts.startswith(TODAY):
                 total += 1
+
         url = data.get("next")
 
     return total
-
+    
 # =========================
 # REPORT
 # =========================
