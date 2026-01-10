@@ -1,0 +1,26 @@
+{
+  "macaroon_dir": "/data/lnd/data/chain/bitcoin/mainnet/",
+  "macaroon_filename": "admin.macaroon",
+  "network": "mainnet",
+  "tlscert": "/data/lnd/tls.cert",
+  "connect": "localhost:10009",
+
+  "econ_ratio": 0.95,
+  "amount": 50000,
+  "min_amount": 1000,
+  "probe_steps": 15,
+  "allow_rapid_rebalance": true,
+
+  "stat": "/home/admin/regolancer-orchestrator/success-rebal.csv",
+  "node_cache_filename": "/home/admin/regolancer-orchestrator/cache.dat",
+  "node_cache_lifetime": 60,
+  "lost_profit": false,
+
+  "from": [],
+  "to": [],
+
+  "timeout_rebalance": 900,
+  "timeout_attempt": 60,
+  "timeout_info": 30,
+  "timeout_route": 180
+}
