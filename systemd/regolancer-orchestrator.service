@@ -1,0 +1,16 @@
+[Unit]
+Description=Regolancer Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/regolancer-orchestrator
+EnvironmentFile=/home/admin/regolancer-orchestrator/.env
+ExecStart=/home/admin/regolancer-orchestrator/venv/bin/python -u /home/admin/regolancer-orchestrator/orchestrator.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
