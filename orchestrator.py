@@ -17,8 +17,6 @@ from logging_utils import log_pair
 # CONFIG
 # =========================
 
-DRY_RUN = False
-
 REGOLANCER_BIN = "/home/admin/regolancer-orchestrator/regolancer"
 TEMPLATE_FILE = "/home/admin/regolancer-orchestrator/config.template.json"
 REPORT_PY = "/home/admin/regolancer-orchestrator/report.py"
@@ -40,6 +38,14 @@ LAST_DAILY_REPORT_FILE = "/home/admin/regolancer-orchestrator/last_daily_report_
 # =========================
 # ENV
 # =========================
+
+def env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
+
+DRY_RUN = env_bool("DRY_RUN", default=True)
 
 def require_env(name):
     if not os.getenv(name):
