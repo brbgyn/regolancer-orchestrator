@@ -13,7 +13,6 @@
 
   "stat": "/home/admin/regolancer-orchestrator/success-rebal.csv",
   "node_cache_filename": "/home/admin/regolancer-orchestrator/cache.dat",
-  "node_cache_lifetime": 60,
   "lost_profit": false,
 
   "from": [],

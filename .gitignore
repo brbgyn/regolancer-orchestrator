@@ -16,3 +16,13 @@ logs/
 .env
 # OS
 .DS_Store
+# Runtime / state files
+daily-report.csv
+lnd-success-rebal.csv
+success-rebal.csv
+last_daily_report_date.txt
+last_success_offset.txt
+# Editor
+*.swp
+*.swo
+*.tmp

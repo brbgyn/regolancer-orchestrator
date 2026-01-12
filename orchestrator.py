@@ -8,15 +8,21 @@ import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+
 from lndg_api import load_channels
 from logic import build_pairs
 from logging_utils import log_pair
 
-# True = teste | False = produção
+# =========================
+# CONFIG
+# =========================
+
 DRY_RUN = False
 
 REGOLANCER_BIN = "/home/admin/regolancer-orchestrator/regolancer"
 TEMPLATE_FILE = "/home/admin/regolancer-orchestrator/config.template.json"
+REPORT_PY = "/home/admin/regolancer-orchestrator/report.py"
+
 RUN_FOREVER = True
 SLEEP_SECONDS = 5
 MAX_WORKERS = 1
@@ -27,6 +33,13 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 SUCCESS_REBAL_FILE = "/home/admin/regolancer-orchestrator/success-rebal.csv"
 SUCCESS_STATE_FILE = "/home/admin/regolancer-orchestrator/last_success_offset.txt"
+
+# estado do report diário
+LAST_DAILY_REPORT_FILE = "/home/admin/regolancer-orchestrator/last_daily_report_date.txt"
+
+# =========================
+# ENV
+# =========================
 
 def require_env(name):
     if not os.getenv(name):
@@ -40,9 +53,28 @@ require_env("LNDG_PASS")
 # =========================
 # TELEGRAM
 # =========================
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+def send_telegram(msg):
+    try:
+        requests.post(
+            TELEGRAM_API_URL,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "disable_web_page_preview": True
+            },
+            timeout=5
+        )
+    except Exception as e:
+        print(f"[ERROR] Telegram: {e}")
+
+# =========================
+# REGOLANCER EXECUTION
+# =========================
 
 def run_regolancer_with_live_logs(cmd, worker_id, prefix):
     proc = subprocess.Popen(
@@ -53,33 +85,12 @@ def run_regolancer_with_live_logs(cmd, worker_id, prefix):
         bufsize=1
     )
 
-    logf = None
-    if ENABLE_FILE_LOGS:
-        log_path = f"{LOG_DIR}/W{worker_id}.log"
-        logf = open(log_path, "a")
-        logf.write(f"\n=== START ===\n")
-        logf.flush()
-
     for line in proc.stdout:
         line = line.rstrip()
-        if not line:
-            continue
+        if line:
+            print(f"[W{worker_id}] {prefix} | {line}")
 
-        # stdout em tempo real (journalctl)
-        print(f"[W{worker_id}] {prefix} | {line}")
-
-        # log em arquivo (opcional)
-        if logf:
-            logf.write(line + "\n")
-            logf.flush()
-
-    rc = proc.wait()
-
-    if logf:
-        logf.write(f"=== END exit={rc} ===\n")
-        logf.close()
-
-    return rc
+    return proc.wait()
 
 def run_pair(worker_id, pair):
     with open(TEMPLATE_FILE) as f:
@@ -103,10 +114,6 @@ def run_pair(worker_id, pair):
             print(f"[W{worker_id}] DRY-RUN → regolancer NÃO executado")
             return
 
-        print(f"[W{worker_id}] === CONFIG JSON ===")
-        print(json.dumps(cfg, indent=2))
-        print(f"[W{worker_id}] === END CONFIG ===")
-
         print(f"[W{worker_id}] START regolancer")
 
         exit_code = run_regolancer_with_live_logs(
@@ -116,6 +123,10 @@ def run_pair(worker_id, pair):
         )
 
         print(f"[W{worker_id}] END regolancer (exit={exit_code})")
+
+# =========================
+# SUCCESS REBAL READER
+# =========================
 
 def read_new_rebalances():
     last_offset = 0
@@ -146,14 +157,50 @@ def read_new_rebalances():
 
     return new_lines
 
-async def main():
-    channels = await load_channels()
-    pairs = build_pairs(channels)
+# =========================
+# DAILY REPORT (23:59)
+# =========================
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for i, pair in enumerate(pairs, start=1):
-            executor.submit(run_pair, i, pair)
+def maybe_run_daily_report():
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
 
+    # só às 23:59
+    if not (now.hour == 23 and now.minute == 59):
+        return
+
+    last_run = None
+    if os.path.exists(LAST_DAILY_REPORT_FILE):
+        with open(LAST_DAILY_REPORT_FILE, "r") as f:
+            last_run = f.read().strip()
+
+    if last_run == today_str:
+        return  # já rodou hoje
+
+    print("[INFO] Running daily report.py")
+
+    try:
+        subprocess.run(
+            ["python3", REPORT_PY],
+            check=True
+        )
+
+        with open(LAST_DAILY_REPORT_FILE, "w") as f:
+            f.write(today_str)
+
+    except Exception as e:
+        print(f"[ERROR] Failed to run report.py: {e}")
+
+# =========================
+# MESSAGE
+# =========================
+
+def format_rebalance_msg(csv_line):
+    return "☯️  ⚡ by Regolancer-Orchestrator"
+
+# =========================
+# MAIN LOOP
+# =========================
 
 async def one_cycle():
     channels = await load_channels()
@@ -163,44 +210,27 @@ async def one_cycle():
         for i, pair in enumerate(pairs, start=1):
             executor.submit(run_pair, i, pair)
 
-def format_rebalance_msg(csv_line):
-    return (
-        "☯️  ⚡ by Regolancer-Orchestrator"
-        #f"`{csv_line}`"
-    )
-
-def send_telegram(msg):
-    try:
-        requests.post(
-            TELEGRAM_API_URL,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg,
-                "disable_web_page_preview": True
-            },
-            timeout=5
-        )
-    except Exception as e:
-        print(f"[ERROR] Telegram: {e}")
-
 def run_loop():
     print("=== REGOLANCER ORCHESTRATOR STARTED ===")
 
     while True:
         try:
-            # 1️⃣ Executa um ciclo completo de rebalances
+            # executa rebalances
             asyncio.run(one_cycle())
 
-            # 2️⃣ APÓS o ciclo: verificar novos sucessos
+            # envia mensagens de sucesso
             new_rebalances = read_new_rebalances()
-
             for line in new_rebalances:
                 msg = format_rebalance_msg(line)
                 send_telegram(msg)
+
+            # ⏰ relatório diário
+            maybe_run_daily_report()
+
         except KeyboardInterrupt:
             print("=== STOP REQUESTED (CTRL+C) ===")
             break
-        except Exception as e:
+        except Exception:
             print("=== ERROR IN ORCHESTRATOR LOOP ===")
             traceback.print_exc()
 
