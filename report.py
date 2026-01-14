@@ -1,10 +1,14 @@
 import csv
-import json
-import subprocess
 import os
-from datetime import datetime, date
 import requests
+import time
+from datetime import datetime, date, timedelta
+from collections import defaultdict
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_session = None
 load_dotenv()
 
 # =========================
@@ -13,13 +17,19 @@ load_dotenv()
 
 BASE_DIR = "/home/admin/regolancer-orchestrator"
 
-SUCCESS_REBAL_CSV = f"{BASE_DIR}/success-rebal.csv"
-LND_SUCCESS_REBAL_CSV = f"{BASE_DIR}/lnd-success-rebal.csv"
 DAILY_REPORT_CSV = f"{BASE_DIR}/daily-report.csv"
+SUCCESS_REBAL_CSV = f"{BASE_DIR}/success-rebal.csv"
 
+DAYS_BACK = 365
 TODAY = date.today()
+START_DATE = TODAY - timedelta(days=DAYS_BACK)
 
-# Telegram (opcional)
+# LNDg
+LNDG_BASE_URL = os.getenv("LNDG_BASE_URL", "http://localhost:8889").rstrip("/")
+LNDG_USER = os.getenv("LNDG_USER")
+LNDG_PASS = os.getenv("LNDG_PASS")
+
+# Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_API_URL = (
@@ -29,208 +39,245 @@ TELEGRAM_API_URL = (
 )
 
 # =========================
-# LND HELPERS
+# UTILS
 # =========================
 
-def lncli(cmd):
-    result = subprocess.run(
-        ["lncli"] + cmd,
-        capture_output=True,
-        text=True,
-        check=True,
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def pct(part, total):
+    return (part / total * 100) if total > 0 else 0.0
+
+# =========================
+# HTTP
+# =========================
+
+def get_lndg_session():
+    global _session
+    if _session is None:
+        s = requests.Session()
+
+        retries = Retry(
+            total=5, backoff_factor=1.5,
+            status_forcelist=[500, 502, 503,
+            504], allowed_methods=["GET"],
+            raise_on_status=False,
+        )
+
+        adapter = HTTPAdapter(max_retries=retries)
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+
+        _session = s
+    return _session
+
+def lndg_get(url):
+    session = get_lndg_session()
+
+    r = session.get(
+        url,
+        auth=(LNDG_USER, LNDG_PASS),
+        timeout=30,
     )
-    return json.loads(result.stdout)
-
-def get_node_pubkey():
-    return lncli(["getinfo"])["identity_pubkey"]
+    r.raise_for_status()
+    return r.json()
 
 # =========================
-# REBALANCE DETECTION
+# LOAD EXISTING REPORT
 # =========================
 
-def is_rebalance(payment, my_pubkey):
-    for htlc in payment.get("htlcs", []):
-        route = htlc.get("route")
-        if not route:
-            continue
+def load_existing_report():
+    daily = {}
 
-        hops = route.get("hops", [])
-        if hops and hops[-1].get("pub_key") == my_pubkey:
-            return True
+    if not os.path.exists(DAILY_REPORT_CSV):
+        return daily
 
-    return False
-
-# =========================
-# BUILD lnd-success-rebal.csv (HOJE)
-# =========================
-
-def build_lnd_success_rebal_csv():
-    my_pubkey = get_node_pubkey()
-
-    data = lncli(["listpayments", "--include_incomplete=false"])
-    payments = data.get("payments", [])
-
-    rows = []
-
-    for p in payments:
-        if p.get("status") != "SUCCEEDED":
-            continue
-
-        if not is_rebalance(p, my_pubkey):
-            continue
-
-        try:
-            epoch_ts = int(p["creation_time_ns"]) // 1_000_000_000
-            created_date = datetime.fromtimestamp(epoch_ts).date()
-        except Exception:
-            continue
-
-        if created_date != TODAY:
-            continue
-
-        try:
-            amount_msat = int(p["value_msat"])
-            fee_msat = int(p.get("fee_msat", 0))
-        except Exception:
-            continue
-
-        htlc = p["htlcs"][0]
-        hops = htlc["route"]["hops"]
-
-        chan_out = hops[0]["chan_id"]
-        chan_in = hops[-1]["chan_id"]
-
-        rows.append([
-            epoch_ts,
-            chan_out,
-            chan_in,
-            amount_msat,
-            fee_msat,
-        ])
-
-    with open(LND_SUCCESS_REBAL_CSV, "w", newline="") as f:
-        csv.writer(f).writerows(rows)
-
-# =========================
-# CSV AGGREGATION (HOJE)
-# =========================
-
-def aggregate_csv_today(path):
-    """
-    Returns:
-      total_amount_msat, total_fee_msat
-    """
-    if not os.path.exists(path):
-        return 0, 0
-
-    total_amount = 0
-    total_fee = 0
-
-    with open(path) as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if len(row) < 5:
-                continue
+    with open(DAILY_REPORT_CSV) as f:
+        reader = csv.DictReader(f)
+        for r in reader:
             try:
-                epoch_ts = int(row[0])
-                created_date = datetime.fromtimestamp(epoch_ts).date()
-                if created_date != TODAY:
-                    continue
-
-                amount_msat = int(row[3])
-                fee_msat = int(row[4])
+                d = datetime.fromisoformat(r["date"]).date()
+                daily[d] = {
+                    "lndg": int(r["lndg_sats"]),
+                    "rego": int(r["regolancer_sats"]),
+                }
             except Exception:
                 continue
 
-            total_amount += amount_msat
-            total_fee += fee_msat
-
-    return total_amount, total_fee
+    log(f"Loaded {len(daily)} days from daily-report.csv")
+    return daily
 
 # =========================
-# DAILY REPORT CSV
+# LNDg REBALANCES (BACKFILL)
 # =========================
 
-def write_daily_report(
-    node_amount_msat,
-    orchestrator_amount_msat,
-    node_fee_msat,
-    orchestrator_fee_msat,
-):
-    pct = (
-        orchestrator_amount_msat / node_amount_msat * 100
-        if node_amount_msat > 0
-        else 0.0
-    )
+def fetch_lndg_rebalances(skip_days):
+    daily = defaultdict(int)
 
-    node_ppm = (
-        node_fee_msat / node_amount_msat * 1_000_000
-        if node_amount_msat > 0
-        else 0.0
-    )
+    url = f"{LNDG_BASE_URL}/api/rebalancer/?limit=100"
+    page = 0
 
-    orchestrator_ppm = (
-        orchestrator_fee_msat / orchestrator_amount_msat * 1_000_000
-        if orchestrator_amount_msat > 0
-        else 0.0
-    )
+    log("Starting LNDg fetch")
 
-    rows = []
+    while url:
+        page += 1
+        data = lndg_get(url)
 
-    if os.path.exists(DAILY_REPORT_CSV):
-        with open(DAILY_REPORT_CSV) as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            rows = list(reader)
+        oldest_date = None
+        processed = 0
+        skipped_existing = 0
 
-    rows = [r for r in rows if r and r[0] != TODAY.isoformat()]
+        for rb in data.get("results", []):
+            if rb.get("status") != 2:
+                continue
 
-    rows.append([
-        TODAY.isoformat(),
-        node_amount_msat // 1000,
-        orchestrator_amount_msat // 1000,
-        round(node_ppm, 1),
-        round(orchestrator_ppm, 1),
-        round(pct, 2),
-    ])
+            try:
+                completed = rb.get("stop") or rb.get("requested")
+                d = datetime.fromisoformat(
+                    completed.replace("Z", "+00:00")
+                ).date()
+            except Exception:
+                continue
+
+            oldest_date = d if oldest_date is None else min(oldest_date, d)
+
+            # fora da janela → para tudo
+            if d < START_DATE:
+                log("Reached records older than DAYS_BACK → stopping")
+                return daily
+
+            if d > TODAY:
+                continue
+
+            processed += 1
+
+            # já está no CSV → skip
+            if d in skip_days:
+                skipped_existing += 1
+                continue
+
+            try:
+                daily[d] += int(rb.get("value") or 0)
+            except Exception:
+                continue
+
+        log(
+            f"Fetching page {page}"
+            + (f" (oldest date: {oldest_date})" if oldest_date else "")
+            + f" | processed={processed}, skipped_existing={skipped_existing}"
+        )
+        time.sleep(0.3)
+
+        # 🔴 REGRA NOVA E CRÍTICA
+        if processed > 0 and processed == skipped_existing:
+            log("All records in this page already present in daily-report.csv → stopping early")
+            break
+
+        url = data.get("next")
+
+    return daily
+
+# =========================
+# REGOLANCER CSV
+# =========================
+
+def load_regolancer_rebalances():
+    daily = defaultdict(int)
+
+    if not os.path.exists(SUCCESS_REBAL_CSV):
+        log("success-rebal.csv not found → Regolancer totals = 0")
+        return daily
+
+    log("Loading Regolancer-Orchestrator rebalances")
+
+    with open(SUCCESS_REBAL_CSV) as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 4:
+                continue
+            try:
+                d = datetime.fromtimestamp(int(row[0])).date()
+                if d < START_DATE or d > TODAY:
+                    continue
+
+                # msat → sat
+                daily[d] += int(row[3]) // 1000
+            except Exception:
+                continue
+
+    log(f"Loaded Regolancer rebalances for {len(daily)} days")
+    return daily
+
+# =========================
+# SAVE REPORT
+# =========================
+
+def save_daily_report(daily):
+    log("Writing daily-report.csv")
 
     with open(DAILY_REPORT_CSV, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
             "date",
-            "total_node_sats",
-            "orchestrator_sats",
-            "node_fee_ppm",
-            "orchestrator_fee_ppm",
-            "orchestrator_pct",
+            "lndg_sats",
+            "regolancer_sats",
         ])
-        writer.writerows(rows)
 
-    return node_ppm, orchestrator_ppm, pct
+        d = START_DATE
+        while d <= TODAY:
+            writer.writerow([
+                d.isoformat(),
+                daily.get(d, {}).get("lndg", 0),
+                daily.get(d, {}).get("rego", 0),
+            ])
+            d += timedelta(days=1)
+
+    log("daily-report.csv written successfully")
 
 # =========================
 # TELEGRAM MESSAGE
 # =========================
 
-def build_telegram_summary(
-    node_sats,
-    orchestrator_sats,
-    node_ppm,
-    orchestrator_ppm,
-    pct,
-):
-    return (
+def build_telegram_message(daily):
+    today = daily.get(TODAY, {})
+    lndg_today = today.get("lndg", 0)
+    rego_today = today.get("rego", 0)
+    total_today = lndg_today + rego_today
+
+    month_start = TODAY.replace(day=1)
+    lndg_month = sum(v.get("lndg", 0) for d, v in daily.items() if d >= month_start)
+    rego_month = sum(v.get("rego", 0) for d, v in daily.items() if d >= month_start)
+    total_month = lndg_month + rego_month
+
+    msg = (
         "📊 *regolancer-orchestrator*\n\n"
-        f"⚡ Node Total Rebals: `{node_sats:,}`\n"
-        f"☯️ Regolancer-Orchestrator: `{orchestrator_sats:,}`\n"
-        f"☯️ Outros: `{node_sats - orchestrator_sats:,}`\n\n"
-        #"💸 Fee média node: `{node_ppm:.1f} ppm`\n"
-        #f"💸 Fee média regolancer: `{orchestrator_ppm:.1f} ppm`\n\n"
-        f"📈 Rebal Share Hoje: `{pct:.2f}%`"
+        f"⚡ Total Rebals Hoje: {total_today:,}\n"
+        f"☯️ LNDg: {lndg_today:,} ({pct(lndg_today, total_today):.2f}%)\n"
+        f"☯️ Regolancer-Orchestrator: {rego_today:,} ({pct(rego_today, total_today):.2f}%)\n\n"
+        "📊 *Mês Atual*\n\n"
+        f"⚡ Total Rebals: {total_month:,}\n"
+        f"☯️ LNDg: {lndg_month:,} ({pct(lndg_month, total_month):.2f}%)\n"
+        f"☯️ Regolancer-Orchestrator: {rego_month:,} ({pct(rego_month, total_month):.2f}%)\n\n"
+        "📊 *Histórico 12m*\n\n"
     )
+
+    for i in range(11, -1, -1):
+        m = (TODAY.replace(day=1) - timedelta(days=30*i))
+        lndg_m = sum(v.get("lndg", 0) for d, v in daily.items() if d.year == m.year and d.month == m.month)
+        rego_m = sum(v.get("rego", 0) for d, v in daily.items() if d.year == m.year and d.month == m.month)
+        total_m = lndg_m + rego_m
+
+        msg += (
+            f"☯️ {m.strftime('%b')}: Total {total_m:,} "
+            f"(LNDg {pct(lndg_m, total_m):.2f}% / "
+            f"Rego {pct(rego_m, total_m):.2f}%)\n"
+        )
+
+    return msg
 
 def send_telegram(msg):
     if not TELEGRAM_API_URL:
+        log("Telegram not configured → skipping send")
         return
 
     requests.post(
@@ -239,44 +286,37 @@ def send_telegram(msg):
             "chat_id": TELEGRAM_CHAT_ID,
             "text": msg,
             "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
         },
         timeout=5,
     )
+    log("Telegram message sent")
 
 # =========================
 # MAIN
 # =========================
 
-def main(send_telegram_msg=True):
-    # 1️⃣ build source of truth
-    build_lnd_success_rebal_csv()
+def main():
+    log("=== REPORT START ===")
 
-    # 2️⃣ aggregate
-    node_amount_msat, node_fee_msat = aggregate_csv_today(LND_SUCCESS_REBAL_CSV)
-    orchestrator_amount_msat, orchestrator_fee_msat = aggregate_csv_today(SUCCESS_REBAL_CSV)
+    daily = load_existing_report()
+    skip_days = set(daily.keys())
 
-    # 3️⃣ write report
-    node_ppm, orchestrator_ppm, pct = write_daily_report(
-        node_amount_msat,
-        orchestrator_amount_msat,
-        node_fee_msat,
-        orchestrator_fee_msat,
-    )
+    rego = load_regolancer_rebalances()
+    lndg = fetch_lndg_rebalances(skip_days)
 
-    # 4️⃣ telegram summary
-    msg = build_telegram_summary(
-        node_sats=node_amount_msat // 1000,
-        orchestrator_sats=orchestrator_amount_msat // 1000,
-        node_ppm=node_ppm,
-        orchestrator_ppm=orchestrator_ppm,
-        pct=pct,
-    )
+    for d, amt in lndg.items():
+        daily.setdefault(d, {})["lndg"] = amt
 
-    if send_telegram_msg:
-        send_telegram(msg)
+    for d, amt in rego.items():
+        daily.setdefault(d, {})["rego"] = amt
 
-    print(msg)
+    save_daily_report(daily)
+
+    msg = build_telegram_message(daily)
+    print("\n" + msg + "\n")
+    send_telegram(msg)
+
+    log("=== REPORT END ===")
 
 if __name__ == "__main__":
     main()

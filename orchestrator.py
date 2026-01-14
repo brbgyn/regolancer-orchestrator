@@ -32,9 +32,6 @@ os.makedirs(LOG_DIR, exist_ok=True)
 SUCCESS_REBAL_FILE = "/home/admin/regolancer-orchestrator/success-rebal.csv"
 SUCCESS_STATE_FILE = "/home/admin/regolancer-orchestrator/last_success_offset.txt"
 
-# estado do report diário
-LAST_DAILY_REPORT_FILE = "/home/admin/regolancer-orchestrator/last_daily_report_date.txt"
-
 # =========================
 # ENV
 # =========================
@@ -63,6 +60,13 @@ require_env("LNDG_PASS")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+SEND_REBALANCE_MSG = env_bool("SEND_REBALANCE_MSG", default=True)
+
+def env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.lower() in ("1", "true", "yes", "on")
 
 def send_telegram(msg):
     try:
@@ -169,19 +173,16 @@ def read_new_rebalances():
 
 def maybe_run_daily_report():
     now = datetime.now()
-    today_str = now.strftime("%Y-%m-%d")
+
+    # flag via .env (default TRUE)
+    enable_daily_report = os.getenv("ENABLE_DAILY_REPORT", "TRUE").upper() == "TRUE"
+
+    if not enable_daily_report:
+        return
 
     # só às 23:59
     if not (now.hour == 23 and now.minute == 59):
         return
-
-    last_run = None
-    if os.path.exists(LAST_DAILY_REPORT_FILE):
-        with open(LAST_DAILY_REPORT_FILE, "r") as f:
-            last_run = f.read().strip()
-
-    if last_run == today_str:
-        return  # já rodou hoje
 
     print("[INFO] Running daily report.py")
 
@@ -190,10 +191,6 @@ def maybe_run_daily_report():
             ["python3", REPORT_PY],
             check=True
         )
-
-        with open(LAST_DAILY_REPORT_FILE, "w") as f:
-            f.write(today_str)
-
     except Exception as e:
         print(f"[ERROR] Failed to run report.py: {e}")
 
@@ -202,7 +199,15 @@ def maybe_run_daily_report():
 # =========================
 
 def format_rebalance_msg(csv_line):
-    return "☯️  ⚡ by Regolancer-Orchestrator"
+    try:
+        parts = csv_line.split(",")
+        amount_msat = int(parts[3])
+        amount_sat = amount_msat // 1000
+        amount_fmt = f"{amount_sat:,}"
+    except Exception:
+        amount_fmt = "?"
+
+    return f"☯️ ⚡ {amount_fmt} by Regolancer-Orchestrator"
 
 # =========================
 # MAIN LOOP
@@ -227,8 +232,9 @@ def run_loop():
             # envia mensagens de sucesso
             new_rebalances = read_new_rebalances()
             for line in new_rebalances:
-                msg = format_rebalance_msg(line)
-                send_telegram(msg)
+                if SEND_REBALANCE_MSG:
+                    msg = format_rebalance_msg(line)
+                    send_telegram(msg)
 
             # ⏰ relatório diário
             maybe_run_daily_report()

@@ -5,8 +5,8 @@
   "tlscert": "/data/lnd/tls.cert",
   "connect": "localhost:10009",
 
-  "econ_ratio": 0.95,
-  "amount": 50000,
+  "econ_ratio": 0.90,
+  "amount": 100000,
   "min_amount": 1000,
   "probe_steps": 15,
   "allow_rapid_rebalance": true,
