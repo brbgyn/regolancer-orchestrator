@@ -6,6 +6,8 @@ import traceback
 import json
 import subprocess
 import tempfile
+import threading
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -31,6 +33,8 @@ os.makedirs(LOG_DIR, exist_ok=True)
 
 SUCCESS_REBAL_FILE = "/home/admin/regolancer-orchestrator/success-rebal.csv"
 SUCCESS_STATE_FILE = "/home/admin/regolancer-orchestrator/last_success_offset.txt"
+
+_last_report_attempt_date = None
 
 # =========================
 # ENV
@@ -172,27 +176,43 @@ def read_new_rebalances():
 # =========================
 
 def maybe_run_daily_report():
+    print("[DEBUG] maybe_run_daily_report called")
+
+    global _last_report_attempt_date
+
+    # flag via env (default TRUE)
+    if os.getenv("ENABLE_DAILY_REPORT", "TRUE").upper() != "TRUE":
+        return
+
     now = datetime.now()
+    today = now.date()
 
-    # flag via .env (default TRUE)
-    enable_daily_report = os.getenv("ENABLE_DAILY_REPORT", "TRUE").upper() == "TRUE"
-
-    if not enable_daily_report:
+    # só depois das 23:59
+    if now.hour < 23 or (now.hour == 23 and now.minute < 59):
         return
 
-    # só às 23:59
-    if not (now.hour == 23 and now.minute == 59):
+    # garante que o orchestrator só tente uma vez por dia
+    if _last_report_attempt_date == today:
         return
 
-    print("[INFO] Running daily report.py")
+    print("[INFO] Attempting to run daily report.py")
 
     try:
         subprocess.run(
-            ["python3", REPORT_PY],
-            check=True
+            [sys.executable, REPORT_PY],
+            check=True,
+            capture_output=True,
+            text=True
         )
-    except Exception as e:
-        print(f"[ERROR] Failed to run report.py: {e}")
+        print("[INFO] daily report.py executed")
+
+    except subprocess.CalledProcessError as e:
+        print("[ERROR] report.py failed")
+        print("stdout:", e.stdout)
+        print("stderr:", e.stderr)
+
+    # marca tentativa (independente de sucesso)
+    _last_report_attempt_date = today
 
 # =========================
 # MESSAGE
@@ -236,9 +256,6 @@ def run_loop():
                     msg = format_rebalance_msg(line)
                     send_telegram(msg)
 
-            # ⏰ relatório diário
-            maybe_run_daily_report()
-
         except KeyboardInterrupt:
             print("=== STOP REQUESTED (CTRL+C) ===")
             break
@@ -249,5 +266,16 @@ def run_loop():
         print(f"=== CYCLE FINISHED — sleeping {SLEEP_SECONDS}s ===")
         time.sleep(SLEEP_SECONDS)
 
+def scheduler_loop():
+    # RELATORIO DIARIO
+    while True:
+        try:
+            maybe_run_daily_report()
+        except Exception:
+            traceback.print_exc()
+
+        time.sleep(30)  # checa a cada 30s
+
 if __name__ == "__main__":
+    threading.Thread(target=scheduler_loop,daemon=True).start()
     run_loop()
