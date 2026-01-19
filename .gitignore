@@ -9,11 +9,13 @@ venv/
 cache.dat
 success-rebal.csv 
 last_success_offset.txt
+amount_state.json
 # Logs
 logs/
 *.log
-# Environment / secrets
+# Environment / secrets / config
 .env
+config.template.json
 # OS
 .DS_Store
 # Runtime / state files
