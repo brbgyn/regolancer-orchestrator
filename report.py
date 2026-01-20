@@ -2,6 +2,8 @@ import csv
 import os
 import requests
 import time
+import fcntl
+import sys
 from datetime import datetime, date, timedelta
 from collections import defaultdict
 from dotenv import load_dotenv
@@ -16,7 +18,7 @@ load_dotenv()
 # =========================
 
 BASE_DIR = "/home/admin/regolancer-orchestrator"
-
+LOCK_FILE = "/tmp/regolancer-report.lock"
 DAILY_REPORT_CSV = f"{BASE_DIR}/daily-report.csv"
 SUCCESS_REBAL_CSV = f"{BASE_DIR}/success-rebal.csv"
 
@@ -48,6 +50,15 @@ def log(msg):
 def pct(part, total):
     return (part / total * 100) if total > 0 else 0.0
 
+def acquire_lock():
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_fd
+    except BlockingIOError:
+        log("Another report.py instance is already running → exiting")
+        sys.exit(0)
+
 # =========================
 # HTTP
 # =========================
@@ -56,24 +67,21 @@ def get_lndg_session():
     global _session
     if _session is None:
         s = requests.Session()
-
         retries = Retry(
-            total=5, backoff_factor=1.5,
-            status_forcelist=[500, 502, 503,
-            504], allowed_methods=["GET"],
+            total=5,
+            backoff_factor=1.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
             raise_on_status=False,
         )
-
         adapter = HTTPAdapter(max_retries=retries)
         s.mount("http://", adapter)
         s.mount("https://", adapter)
-
         _session = s
     return _session
 
 def lndg_get(url):
     session = get_lndg_session()
-
     r = session.get(
         url,
         auth=(LNDG_USER, LNDG_PASS),
@@ -98,8 +106,9 @@ def load_existing_report():
             try:
                 d = datetime.fromisoformat(r["date"]).date()
                 daily[d] = {
-                    "lndg": int(r["lndg_sats"]),
-                    "rego": int(r["regolancer_sats"]),
+                    "lndg": int(r.get("lndg_sats", 0)),
+                    "rego": int(r.get("regolancer_sats", 0)),
+                    "fw_sats": int(r.get("forwards_sats", 0)),
                 }
             except Exception:
                 continue
@@ -108,29 +117,26 @@ def load_existing_report():
     return daily
 
 # =========================
-# LNDg REBALANCES (BACKFILL)
+# LNDg REBALANCES
 # =========================
 
 def fetch_lndg_rebalances(skip_days):
     daily = defaultdict(int)
 
-    url = f"{LNDG_BASE_URL}/api/rebalancer/?limit=100"
+    url = f"{LNDG_BASE_URL}/api/rebalancer/?status=2&limit=100"
     page = 0
 
-    log("Starting LNDg fetch")
+    log("Starting LNDg rebalances fetch")
 
     while url:
         page += 1
         data = lndg_get(url)
 
-        oldest_date = None
         processed = 0
         skipped_existing = 0
+        oldest_date = None
 
         for rb in data.get("results", []):
-            if rb.get("status") != 2:
-                continue
-
             try:
                 completed = rb.get("stop") or rb.get("requested")
                 d = datetime.fromisoformat(
@@ -141,9 +147,8 @@ def fetch_lndg_rebalances(skip_days):
 
             oldest_date = d if oldest_date is None else min(oldest_date, d)
 
-            # fora da janela → para tudo
             if d < START_DATE:
-                log("Reached records older than DAYS_BACK → stopping")
+                log("Reached rebals older than DAYS_BACK → stopping")
                 return daily
 
             if d > TODAY:
@@ -151,26 +156,22 @@ def fetch_lndg_rebalances(skip_days):
 
             processed += 1
 
-            # já está no CSV → skip
             if d in skip_days:
                 skipped_existing += 1
                 continue
 
-            try:
-                daily[d] += int(rb.get("value") or 0)
-            except Exception:
-                continue
+            daily[d] += int(rb.get("value") or 0)
 
         log(
-            f"Fetching page {page}"
+            f"Rebals page {page}"
             + (f" (oldest date: {oldest_date})" if oldest_date else "")
             + f" | processed={processed}, skipped_existing={skipped_existing}"
         )
+
         time.sleep(0.3)
 
-        # 🔴 REGRA NOVA E CRÍTICA
         if processed > 0 and processed == skipped_existing:
-            log("All records in this page already present in daily-report.csv → stopping early")
+            log("All rebals in this page already processed → stopping early")
             break
 
         url = data.get("next")
@@ -178,7 +179,7 @@ def fetch_lndg_rebalances(skip_days):
     return daily
 
 # =========================
-# REGOLANCER CSV
+# REGOLANCER REBALANCES
 # =========================
 
 def load_regolancer_rebalances():
@@ -199,13 +200,77 @@ def load_regolancer_rebalances():
                 d = datetime.fromtimestamp(int(row[0])).date()
                 if d < START_DATE or d > TODAY:
                     continue
-
-                # msat → sat
                 daily[d] += int(row[3]) // 1000
             except Exception:
                 continue
 
     log(f"Loaded Regolancer rebalances for {len(daily)} days")
+    return daily
+
+# =========================
+# LNDg FORWARDS (VOLUME)
+# =========================
+
+def fetch_lndg_forwards(skip_days):
+    daily = defaultdict(int)
+
+    url = f"{LNDG_BASE_URL}/api/forwards/?limit=100"
+    page = 0
+
+    log("Starting LNDg forwards fetch")
+
+    while url:
+        page += 1
+        data = lndg_get(url)
+
+        processed = 0
+        skipped_existing = 0
+        oldest_date = None
+
+        for fw in data.get("results", []):
+            try:
+                # forward_date vem em ISO8601
+                d = datetime.fromisoformat(
+                    fw["forward_date"]
+                ).date()
+            except Exception:
+                continue
+
+            oldest_date = d if oldest_date is None else min(oldest_date, d)
+
+            # fora da janela histórica
+            if d < START_DATE:
+                log("Reached forwards older than DAYS_BACK → stopping")
+                return daily
+
+            if d > TODAY:
+                continue
+
+            processed += 1
+
+            # dia já consolidado
+            if d in skip_days:
+                skipped_existing += 1
+                continue
+
+            # msat → sat
+            daily[d] += int(fw.get("amt_out_msat", 0)) // 1000
+
+        log(
+            f"Forwards page {page}"
+            + (f" (oldest date: {oldest_date})" if oldest_date else "")
+            + f" | processed={processed}, skipped_existing={skipped_existing}"
+        )
+
+        time.sleep(0.3)
+
+        # early stop inteligente
+        if processed > 0 and processed == skipped_existing:
+            log("All forwards in this page already processed → stopping early")
+            break
+
+        url = data.get("next")
+
     return daily
 
 # =========================
@@ -221,6 +286,7 @@ def save_daily_report(daily):
             "date",
             "lndg_sats",
             "regolancer_sats",
+            "forwards_sats",
         ])
 
         d = START_DATE
@@ -229,6 +295,7 @@ def save_daily_report(daily):
                 d.isoformat(),
                 daily.get(d, {}).get("lndg", 0),
                 daily.get(d, {}).get("rego", 0),
+                daily.get(d, {}).get("fw_sats", 0),
             ])
             d += timedelta(days=1)
 
@@ -239,38 +306,58 @@ def save_daily_report(daily):
 # =========================
 
 def build_telegram_message(daily):
-    today = daily.get(TODAY, {})
-    lndg_today = today.get("lndg", 0)
-    rego_today = today.get("rego", 0)
-    total_today = lndg_today + rego_today
-
-    month_start = TODAY.replace(day=1)
-    lndg_month = sum(v.get("lndg", 0) for d, v in daily.items() if d >= month_start)
-    rego_month = sum(v.get("rego", 0) for d, v in daily.items() if d >= month_start)
-    total_month = lndg_month + rego_month
-
     msg = (
         "📊 *regolancer-orchestrator*\n\n"
-        f"⚡ Total Rebals Hoje: {total_today:,}\n"
-        f"☯️ LNDg: {lndg_today:,} ({pct(lndg_today, total_today):.2f}%)\n"
-        f"☯️ Regolancer-Orchestrator: {rego_today:,} ({pct(rego_today, total_today):.2f}%)\n\n"
-        "📊 *Mês Atual*\n\n"
-        f"⚡ Total Rebals: {total_month:,}\n"
-        f"☯️ LNDg: {lndg_month:,} ({pct(lndg_month, total_month):.2f}%)\n"
-        f"☯️ Regolancer-Orchestrator: {rego_month:,} ({pct(rego_month, total_month):.2f}%)\n\n"
-        "📊 *Histórico 12m*\n\n"
     )
 
+    # HOJE
+    today = daily.get(TODAY, {})
+    fw_today = today.get("fw_sats", 0)
+    lndg_today = today.get("lndg", 0)
+    rego_today = today.get("rego", 0)
+    rebals_today = lndg_today + rego_today
+
+    msg += (
+        f"💰 Forwards Hoje: {fw_today:,}\n"
+        f"☯️ Rebals Hoje: {rebals_today:,}\n"
+        f"☯️ LNDg: {lndg_today:,} ({pct(lndg_today, rebals_today):.2f}%)\n"
+        f"☯️ Rego-Orchestrator: {rego_today:,} ({pct(rego_today, rebals_today):.2f}%)\n\n"
+    )
+
+    # MÊS ATUAL
+    month_start = TODAY.replace(day=1)
+
+    fw_month = sum(v.get("fw_sats", 0) for d, v in daily.items() if d >= month_start)
+    lndg_month = sum(v.get("lndg", 0) for d, v in daily.items() if d >= month_start)
+    rego_month = sum(v.get("rego", 0) for d, v in daily.items() if d >= month_start)
+    rebals_month = lndg_month + rego_month
+
+    msg += (
+        "📊 *Mês Atual*\n\n"
+        f"💰 Total Forwards: {fw_month:,}\n"
+        f"☯️ Total Rebals: {rebals_month:,}\n"
+        f"☯️ LNDg: {lndg_month:,} ({pct(lndg_month, rebals_month):.2f}%)\n"
+        f"☯️ Rego-Orchestrator: {rego_month:,} ({pct(rego_month, rebals_month):.2f}%)\n\n"
+    )
+
+    # HISTÓRICO 12M
+    msg += "📊 *Histórico 12m*\n\n"
+
     for i in range(11, -1, -1):
-        m = (TODAY.replace(day=1) - timedelta(days=30*i))
-        lndg_m = sum(v.get("lndg", 0) for d, v in daily.items() if d.year == m.year and d.month == m.month)
-        rego_m = sum(v.get("rego", 0) for d, v in daily.items() if d.year == m.year and d.month == m.month)
-        total_m = lndg_m + rego_m
+        m = (TODAY.replace(day=1) - timedelta(days=30 * i))
+        year, month = m.year, m.month
+
+        fw_m = sum(v.get("fw_sats", 0) for d, v in daily.items() if d.year == year and d.month == month)
+        lndg_m = sum(v.get("lndg", 0) for d, v in daily.items() if d.year == year and d.month == month)
+        rego_m = sum(v.get("rego", 0) for d, v in daily.items() if d.year == year and d.month == month)
+        rebals_m = lndg_m + rego_m
 
         msg += (
-            f"☯️ {m.strftime('%b')}: Total {total_m:,} "
-            f"(LNDg {pct(lndg_m, total_m):.2f}% / "
-            f"Rego {pct(rego_m, total_m):.2f}%)\n"
+            f"🗓️ *{m.strftime('%B')}*:\n"
+            f"💰 Forwards {fw_m:,}\n"
+            f"☯️ Rebals {rebals_m:,}\n"
+            f"☯️ (LNDg {pct(lndg_m, rebals_m):.2f}% / "
+            f"Rego-Orch {pct(rego_m, rebals_m):.2f}%)\n\n"
         )
 
     return msg
@@ -296,6 +383,8 @@ def send_telegram(msg):
 # =========================
 
 def main():
+    lock_fd = acquire_lock()
+
     log("=== REPORT START ===")
 
     daily = load_existing_report()
@@ -303,12 +392,16 @@ def main():
 
     rego = load_regolancer_rebalances()
     lndg = fetch_lndg_rebalances(skip_days)
+    fw = fetch_lndg_forwards(skip_days)
 
     for d, amt in lndg.items():
         daily.setdefault(d, {})["lndg"] = amt
 
     for d, amt in rego.items():
         daily.setdefault(d, {})["rego"] = amt
+
+    for d, amt in fw.items():
+        daily.setdefault(d, {})["fw_sats"] = amt
 
     save_daily_report(daily)
 
