@@ -265,6 +265,59 @@ def telegram_notifier_loop():
         time.sleep(2)  # polling rápido e leve
 
 # =========================
+# DAILY REPORT (23:59)
+# =========================
+
+def maybe_run_daily_report():
+    #print("[DEBUG] maybe_run_daily_report called")
+
+    global _last_report_attempt_date
+
+    # flag via env (default TRUE)
+    if os.getenv("ENABLE_DAILY_REPORT", "TRUE").upper() != "TRUE":
+        return
+
+    now = datetime.now()
+    today = now.date()
+
+    # só depois das 23:59
+    if now.hour < 23 or (now.hour == 23 and now.minute < 59):
+        return
+
+    # garante que o orchestrator só tente uma vez por dia
+    if _last_report_attempt_date == today:
+        return
+
+    print("[INFO] Attempting to run daily report.py")
+
+    try:
+        subprocess.run(
+            [sys.executable, REPORT_PY],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        print("[INFO] daily report.py executed")
+
+    except subprocess.CalledProcessError as e:
+        print("[ERROR] report.py failed")
+        print("stdout:", e.stdout)
+        print("stderr:", e.stderr)
+
+    # marca tentativa (independente de sucesso)
+    _last_report_attempt_date = today
+
+def scheduler_loop():
+    # RELATORIO DIARIO
+    while True:
+        try:
+            maybe_run_daily_report()
+        except Exception:
+            traceback.print_exc()
+
+        time.sleep(30)  # checa a cada 30s
+
+# =========================
 # MAIN
 # =========================
 
@@ -282,6 +335,12 @@ if __name__ == "__main__":
     # telegram notifier
     threading.Thread(
         target=telegram_notifier_loop,
+        daemon=True
+    ).start()
+
+    # daily report scheduler
+    threading.Thread(
+        target=scheduler_loop,
         daemon=True
     ).start()
 
