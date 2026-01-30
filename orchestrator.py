@@ -199,12 +199,79 @@ def worker_loop(worker_id):
         time.sleep(SLEEP_SECONDS)
 
 # =========================
+# SUCCESS REBAL READER
+# =========================
+
+def read_new_rebalances():
+    last_offset = 0
+
+    if os.path.exists(SUCCESS_STATE_FILE):
+        with open(SUCCESS_STATE_FILE, "r") as f:
+            try:
+                last_offset = int(f.read().strip())
+            except ValueError:
+                last_offset = 0
+
+    if not os.path.exists(SUCCESS_REBAL_FILE):
+        return []
+
+    new_lines = []
+
+    with open(SUCCESS_REBAL_FILE, "r") as f:
+        f.seek(last_offset)
+        for line in f:
+            line = line.strip()
+            if line:
+                new_lines.append(line)
+
+        new_offset = f.tell()
+
+    with open(SUCCESS_STATE_FILE, "w") as f:
+        f.write(str(new_offset))
+
+    return new_lines
+
+# =========================
+# MESSAGE
+# =========================
+
+def format_rebalance_msg(csv_line):
+    try:
+        parts = csv_line.split(",")
+        amount_msat = int(parts[3])
+        amount_sat = amount_msat // 1000
+        amount_fmt = f"{amount_sat:,}"
+    except Exception:
+        amount_fmt = "?"
+
+    return f"☯️ ⚡ {amount_fmt} by Regolancer-Orchestrator"
+
+def telegram_notifier_loop():
+    print("[TELEGRAM] notifier started")
+
+    while True:
+        try:
+            new_rebalances = read_new_rebalances()
+
+            for line in new_rebalances:
+                if SEND_REBALANCE_MSG:
+                    msg = format_rebalance_msg(line)
+                    send_telegram(msg)
+
+        except Exception:
+            print("[TELEGRAM] ERROR")
+            traceback.print_exc()
+
+        time.sleep(2)  # polling rápido e leve
+
+# =========================
 # MAIN
 # =========================
 
 if __name__ == "__main__":
     print("=== REGOLANCER ORCHESTRATOR (MULTI-WORKER MODE) ===")
 
+    # workers
     for wid in range(1, MAX_WORKERS + 1):
         threading.Thread(
             target=worker_loop,
@@ -212,5 +279,12 @@ if __name__ == "__main__":
             daemon=True
         ).start()
 
+    # telegram notifier
+    threading.Thread(
+        target=telegram_notifier_loop,
+        daemon=True
+    ).start()
+
+    # keep main alive
     while True:
         time.sleep(3600)
