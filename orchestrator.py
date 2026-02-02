@@ -45,7 +45,8 @@ REGOLANCER_BIN   = "/home/admin/regolancer-orchestrator/regolancer"
 TEMPLATE_FILE    = "/home/admin/regolancer-orchestrator/config.template.json"
 REPORT_PY        = "/home/admin/regolancer-orchestrator/report.py"
 AMOUNT_STATE_FILE = "/home/admin/regolancer-orchestrator/amount_state.json"
-
+LAST_REPORT_FILE = "/home/admin/regolancer-orchestrator/last_report_date.txt"
+LAST_REPORT_ERROR_FILE = "/home/admin/regolancer-orchestrator/last_report_error_date.txt"
 SUCCESS_REBAL_FILE = "/home/admin/regolancer-orchestrator/success-rebal.csv"
 SUCCESS_STATE_FILE = "/home/admin/regolancer-orchestrator/last_success_offset.txt"
 
@@ -152,19 +153,22 @@ def run_regolancer(worker_id, pair, amount, pair_id):
         #    f"{src['alias']} → {tgt['alias']}"
         #)
 
+        stdout_target = subprocess.PIPE if REGOLANCER_LIVE_LOGS else subprocess.DEVNULL
+        stderr_target = subprocess.STDOUT if REGOLANCER_LIVE_LOGS else subprocess.DEVNULL
+
         proc = subprocess.Popen(
             [REGOLANCER_BIN, "--config", tmp.name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
+            stdout=stdout_target,
+            stderr=stderr_target,
+            text=REGOLANCER_LIVE_LOGS,  # só precisa se for ler
+            bufsize=1 if REGOLANCER_LIVE_LOGS else 0
         )
 
-        for line in proc.stdout:
-            if REGOLANCER_LIVE_LOGS:
+        if REGOLANCER_LIVE_LOGS and proc.stdout is not None:
+            for line in proc.stdout:
                 print(f"{prefix} {line.rstrip()}")
 
-        exit_code = proc.wait()
+        proc.wait()
 
 # =========================
 # WORKER LOOP
@@ -262,30 +266,67 @@ def telegram_notifier_loop():
             print("[TELEGRAM] ERROR")
             traceback.print_exc()
 
-        time.sleep(2)  # polling rápido e leve
+        time.sleep(30)
 
 # =========================
 # DAILY REPORT (23:59)
 # =========================
 
+def read_last_report_date():
+    if not os.path.exists(LAST_REPORT_FILE):
+        return None
+    try:
+        with open(LAST_REPORT_FILE, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def write_last_report_date(date_str):
+    try:
+        with open(LAST_REPORT_FILE, "w") as f:
+            f.write(date_str)
+    except Exception as e:
+        print(f"[ERROR] Failed to write LAST_REPORT_FILE: {e}")
+
+def read_last_report_error_date():
+    if not os.path.exists(LAST_REPORT_ERROR_FILE):
+        return None
+    try:
+        with open(LAST_REPORT_ERROR_FILE, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def write_last_report_error_date(date_str):
+    try:
+        with open(LAST_REPORT_ERROR_FILE, "w") as f:
+            f.write(date_str)
+    except Exception as e:
+        print(f"[ERROR] Failed to write LAST_REPORT_ERROR_FILE: {e}")
+
+
+def clear_last_report_error_date():
+    try:
+        if os.path.exists(LAST_REPORT_ERROR_FILE):
+            os.remove(LAST_REPORT_ERROR_FILE)
+    except Exception as e:
+        print(f"[ERROR] Failed to clear LAST_REPORT_ERROR_FILE: {e}")
+
 def maybe_run_daily_report():
-    #print("[DEBUG] maybe_run_daily_report called")
-
-    global _last_report_attempt_date
-
-    # flag via env (default TRUE)
     if os.getenv("ENABLE_DAILY_REPORT", "TRUE").upper() != "TRUE":
         return
 
     now = datetime.now()
-    today = now.date()
+    today_str = now.date().isoformat()
 
     # só depois das 23:59
     if now.hour < 23 or (now.hour == 23 and now.minute < 59):
         return
 
-    # garante que o orchestrator só tente uma vez por dia
-    if _last_report_attempt_date == today:
+    # já rodou com sucesso hoje
+    if read_last_report_date() == today_str:
         return
 
     print("[INFO] Attempting to run daily report.py")
@@ -297,22 +338,40 @@ def maybe_run_daily_report():
             capture_output=True,
             text=True
         )
-        print("[INFO] daily report.py executed")
+
+        print("[INFO] daily report.py executed successfully")
+
+        write_last_report_date(today_str)
+        clear_last_report_error_date()  # limpa estado de erro
 
     except subprocess.CalledProcessError as e:
         print("[ERROR] report.py failed")
-        print("stdout:", e.stdout)
-        print("stderr:", e.stderr)
 
-    # marca tentativa (independente de sucesso)
-    _last_report_attempt_date = today
+        stderr = (e.stderr or "").strip()
+        stdout = (e.stdout or "").strip()
+
+        # evita spam: só 1 telegram por dia de erro
+        last_error_date = read_last_report_error_date()
+        if last_error_date != today_str:
+            msg = (
+                "❌ Daily report failed\n\n"
+                f"📅 Date: {today_str}\n\n"
+                f"STDERR:\n{stderr[:350]}\n\n"
+                f"STDOUT:\n{stdout[:350]}"
+            )
+            send_telegram(msg)
+            write_last_report_error_date(today_str)
+
+        # continua tentando a cada 30s
 
 def scheduler_loop():
-    # RELATORIO DIARIO
+    print("[SCHEDULER] daily report scheduler started")
+
     while True:
         try:
             maybe_run_daily_report()
         except Exception:
+            print("[SCHEDULER] ERROR")
             traceback.print_exc()
 
         time.sleep(30)  # checa a cada 30s
