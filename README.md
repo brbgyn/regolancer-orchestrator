@@ -3,10 +3,13 @@
 The **Regolancer-Orchestrator** wraps the `regolancer` CLI and LNDg to run automated,
 continuous rebalance cycles on a Lightning node.
 
-It pulls channel data from LNDg, selects source and target channels based on
+It pulls channel data from LNDg, selects source and target channel pairs based on
 LNDg auto-rebalance targets, generates a temporary `regolancer` config for each
 pair, runs the CLI, sends Telegram notifications for successful rebalances, and
 produces a detailed daily rebalance report.
+
+The orchestrator is designed to run **24/7 for years**, with special care taken
+to minimize CPU usage, disk writes, thermal load, and log noise.
 
 ---
 
@@ -15,285 +18,222 @@ produces a detailed daily rebalance report.
 - Reads open and active channels from the LNDg API.
 - Builds source and target channel pairs using LNDg targets and live balances.
 - Runs `regolancer` for each pair with a generated config.
+- Enforces per-worker cycle timeouts to avoid stale decisions.
+- Optionally randomizes pair order for fair scheduling under time limits.
 - Tracks successes in CSV files and sends Telegram notifications.
-- Writes a daily report comparing:
-  - Total LNDg rebalances
-  - Total Regolancer-Orchestrator rebalances
-  - Relative share percentages
-  - Monthly and 12‑month history
+- Produces a daily report with historical comparisons.
 
 ---
 
 ## Repository layout
 
-- `orchestrator.py` – main loop that runs rebalance cycles and Telegram alerts.
+- `orchestrator.py` – main daemon running rebalance workers, scheduler and notifier.
 - `lndg_api.py` – LNDg channel fetch and normalization.
-- `logic.py` – pairing logic and target percentages.
+- `logic.py` – pairing logic and target percentage calculations.
 - `logging_utils.py` – compact pair logging helper.
 - `report.py` – daily and historical CSV summary writer.
 - `config.template.json` – base `regolancer` config with LND connection details.
-- `regolancer` – CLI binary (replace with your own build if needed).
-- `requirements.txt` – Python runtime dependencies.
-- `.env.example` – sample environment file for LNDg and Telegram.
+- `regolancer` – CLI binary.
+- `.env.example` – fully documented environment configuration.
 - `systemd/regolancer-orchestrator.service` – systemd unit template.
-
----
-
-## How pairing works
-
-Each cycle loads LNDg channels and calculates an effective local balance
-including pending outbound HTLCs.
-
-Pairs are built as follows:
-
-- **Source channels**
-  - Auto‑rebalance OFF in LNDg
-  - `local_pct` greater than `ar_out_target`
-
-- **Target channels**
-  - Auto‑rebalance ON in LNDg
-  - `local_pct` lower than `100 - ar_in_target`
-
-For each source/target pair:
-- `pfrom = 100 - ar_out_target`
-- `pto = 100 - ar_in_target`
-
-This means:
-- Sources are channels you want to drain.
-- Targets are channels you want to fill.
 
 ---
 
 ## Prerequisites
 
-- Linux host.
-- A fully synced LND node with macaroon and TLS cert available.
-- LNDg running with API access enabled.
-- A working `regolancer` CLI binary.
+- Linux host
+- Fully synced LND node
+- LNDg running with API enabled
+- Working `regolancer` binary
 - Python **3.9+**
-- Telegram bot token and chat ID.
+- Telegram bot token and chat ID
 
 ---
 
 ## Installation
 
-1. Clone the repository and enter it.
-2. Create a virtual environment and install dependencies:
+```bash
+git clone https://github.com/your/repo.git
+cd regolancer-orchestrator
 
-```
 python -m venv venv
 ./venv/bin/pip install -r requirements.txt
-```
-
-3. Ensure the `regolancer` binary is executable:
-
-```
-chmod +x ./regolancer
-```
-
-4. Update `config.template.json` with your LND connection details:
-   - `macaroon_dir`
-   - `macaroon_filename`
-   - `tlscert`
-   - `connect`
-   - Adjust amounts and timeouts as needed.
-
-5. Create your environment file:
-
-```
+chmod +x regolancer
 cp .env.example .env
 ```
 
-6. Run the orchestrator:
+Edit `.env` and `config.template.json`, then run:
 
-```
+```bash
 ./venv/bin/python orchestrator.py
 ```
 
 ---
 
-## Configuration
+## Environment configuration (`.env`)
 
-### Environment variables (required)
-
-Used by `orchestrator.py`:
-
-- `TELEGRAM_TOKEN` – Telegram bot token.
-- `TELEGRAM_CHAT_ID` – Telegram chat ID.
-- `LNDG_USER` – LNDg API username.
-- `LNDG_PASS` – LNDg API password.
-
-Used by `report.py`:
-
-- `LNDG_BASE_URL` – Base URL of the LNDg API (example: `http://localhost:8889`).
-
-> Note: `lndg_api.py` defaults to `http://localhost:8889`.
+All runtime behavior is controlled via environment variables.
+Below is a full description of **every supported option**.
 
 ---
 
-### Environment file (`.env`)
+### DRY RUN
 
-Copy the example:
-
-```
-cp .env.example .env
+```env
+DRY_RUN=false
 ```
 
-Load manually if needed:
-
-```
-set -a
-source .env
-set +a
-```
-
-Systemd loads it automatically via `EnvironmentFile`.
+When `true`, `regolancer` is **not executed**.
+Use for testing configuration and pairing logic.
 
 ---
 
-### Optional environment flags
+### LNDg API
 
+```env
+LNDG_BASE_URL=http://localhost:8889
+LNDG_USER=
+LNDG_PASS=
 ```
-DRY_RUN=FALSE
+
+Credentials and base URL used to fetch channel data from LNDg.
+
+---
+
+### Telegram
+
+```env
+TELEGRAM_TOKEN=
+TELEGRAM_CHAT_ID=
+```
+
+Used for:
+- Successful rebalance notifications
+- Daily report error alerts
+
+---
+
+### Notifications & reports
+
+```env
+SEND_REBALANCE_MSG=TRUE
 ENABLE_DAILY_REPORT=TRUE
 ```
 
-- `DRY_RUN=TRUE` – do not execute `regolancer`, only print channel pairs and configs.
-- `ENABLE_DAILY_REPORT=FALSE` – disable automatic daily report execution at 23:59.
+- `SEND_REBALANCE_MSG` – send Telegram message on each successful rebalance.
+- `ENABLE_DAILY_REPORT` – run daily report automatically at 23:59.
 
 ---
 
-## Paths and constants (`orchestrator.py`)
+### Regolancer debug options
 
-Defaults assume `/home/admin/regolancer-orchestrator`:
+```env
+REGOLANCER_LIVE_LOGS=FALSE
+LOG_TEMPLATE_CONFIG=FALSE
+```
 
-- `REGOLANCER_BIN`
-- `TEMPLATE_FILE`
-- `LOG_DIR`
-- `SUCCESS_REBAL_FILE`
-- `SUCCESS_STATE_FILE`
+- `REGOLANCER_LIVE_LOGS`
+  - Streams regolancer stdout/stderr.
+  - High CPU and log noise. Debug only.
 
-Operational settings:
-- `DRY_RUN`
-- `SLEEP_SECONDS`
-- `MAX_WORKERS`
+- `LOG_TEMPLATE_CONFIG`
+  - Prints generated JSON configs.
+  - Debug only.
+
+---
+
+### Rebalance amount strategy
+
+```env
+AMOUNT_INITIAL=19532
+AMOUNT_INCREASE_PERCENT=200
+AMOUNT_EVERY_ROUNDS=1
+AMOUNT_MAX_INCREASES=2
+```
+
+Controls how rebalance amounts evolve over time.
+
+- Start with `AMOUNT_INITIAL`
+- Increase by `AMOUNT_INCREASE_PERCENT` every `AMOUNT_EVERY_ROUNDS`
+- Reset after `AMOUNT_MAX_INCREASES`
+
+---
+
+### Worker execution
+
+```env
+RUN_FOREVER=true
+SLEEP_SECONDS=5
+MAX_WORKERS=2
+MAX_CYCLE_SECONDS=300
+```
+
+- `RUN_FOREVER` – keep workers running indefinitely.
+- `SLEEP_SECONDS` – delay between cycles.
+- `MAX_WORKERS` – number of parallel workers.
+- `MAX_CYCLE_SECONDS` – abort and restart cycle if exceeded.
+
+---
+
+### Scheduling behavior
+
+```env
+RANDOMIZE_PAIRS=TRUE
+```
+
+Randomizes pair order per cycle to avoid starvation
+when cycles time out before all pairs are processed.
+
+---
+
+### Logging & performance
+
+```env
+LOG_OPERATIONAL=FALSE
+ENABLE_FILE_LOGS=FALSE
+```
+
+- `LOG_OPERATIONAL`
+  - Enables verbose per-pair logs.
+  - Strongly recommended `FALSE` in production.
+
 - `ENABLE_FILE_LOGS`
+  - Reserved for future extensions.
 
 ---
 
-## config.template.json
+## Error logging
 
-Base config passed to `regolancer`, mutated per pair.
-
-Important fields:
-- `stat` must match `SUCCESS_REBAL_FILE`
-- `from` / `to` overwritten each run
-- `pfrom` / `pto` injected per pair
-
----
-
-## Excluding channels
-
-Add channel IDs to `EXCLUSION_LIST` in `lndg_api.py`.
-
----
-
-## Usage
-
-Run continuous orchestration:
+All critical errors are written to:
 
 ```
-./venv/bin/python orchestrator.py
+errors.log
 ```
 
-Expected output:
-- Pair selection logs
-- Live `regolancer` stdout
-- Cycle start/finish markers
-
----
-
-## Telegram notifications
-
-Each successful rebalance sends:
-
-```
-☯️ ⚡ 125,000 by Regolancer-Orchestrator
-```
-
----
-
-## Daily report
-
-`report.py` generates a daily CSV and Telegram summary.
-
-- Uses LNDg as authoritative source
-- Backfills up to 12 months once
-- Subsequent runs are incremental
-
-Outputs:
-- `daily-report.csv`
-- Telegram summary (if enabled)
-
----
-
-## Example daily Telegram summary
-
-```
-📊 regolancer-orchestrator
-
-⚡ Total Rebals Hoje: X,XXX,XXX
-☯️ LNDg: X,XXX,XXX (30%)
-☯️ Regolancer-Orchestrator: X,XXX,XXX (70%)
-
-📊 Mês Atual
-
-⚡ Total Rebals: X,XXX,XXX
-☯️ LNDg: X,XXX,XXX (20%)
-☯️ Regolancer-Orchestrator: X,XXX,XXX (80%)
-
-📊 Histórico 12m
-
-☯️ Feb: Total 0 (LNDg 0.00% / Rego 0.00%)
-☯️ Mar: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ Apr: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ May: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ Jun: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ Jul: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ Aug: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ Sep: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ Oct: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ Nov: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ Dec: Total X,XXX,XXX (LNDg 100.00% / Rego 0.00%)
-☯️ Jan: Total X,XXX,XXX (LNDg 35% / Rego 65%)
-```
+Includes:
+- Unhandled exceptions
+- Cycle timeouts
+- Scheduler and notifier failures
 
 ---
 
 ## Systemd service
 
-Template in `systemd/regolancer-orchestrator.service`.
-
-Install:
-
-```
+```bash
 sudo cp systemd/regolancer-orchestrator.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now regolancer-orchestrator
-```
-
-Logs:
-
-```
 journalctl -u regolancer-orchestrator -f
 ```
 
 ---
 
-## Troubleshooting
+## Final notes
 
-- `Missing required env var` → check `.env`.
-- LNDg API errors → verify credentials and base URL.
-- `regolancer` connection errors → validate macaroon and TLS paths.
+This project prioritizes:
+- Correctness over speed
+- Fresh channel data
+- Fair scheduling
+- Minimal CPU, IO and thermal footprint
 
----
+Designed for long-term, always-on Lightning nodes.
