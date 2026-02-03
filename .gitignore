@@ -24,6 +24,7 @@ lnd-success-rebal.csv
 success-rebal.csv
 last_daily_report_date.txt
 last_success_offset.txt
+last_report_date.txt
 # Editor
 *.swp
 *.swo

@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import sys
+import random
 sys.stdout.reconfigure(line_buffering=True)
 from datetime import datetime
 from dotenv import load_dotenv
@@ -31,15 +32,17 @@ def env_bool(name: str, default: bool = False) -> bool:
 # CONFIG (ENV)
 # =========================
 
+LOG_OPERATIONAL = env_bool("LOG_OPERATIONAL", False)
 RUN_FOREVER       = env_bool("RUN_FOREVER", True)
 SLEEP_SECONDS     = int(os.getenv("SLEEP_SECONDS", "5"))
 MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "1"))
 ENABLE_FILE_LOGS  = env_bool("ENABLE_FILE_LOGS", False)
-
 DRY_RUN               = env_bool("DRY_RUN", True)
 REGOLANCER_LIVE_LOGS  = env_bool("REGOLANCER_LIVE_LOGS", True)
 LOG_TEMPLATE_CONFIG   = env_bool("LOG_TEMPLATE_CONFIG", False)
 SEND_REBALANCE_MSG    = env_bool("SEND_REBALANCE_MSG", True)
+MAX_CYCLE_SECONDS = int(os.getenv("MAX_CYCLE_SECONDS", "300"))
+RANDOMIZE_PAIRS = env_bool("RANDOMIZE_PAIRS", True)
 
 REGOLANCER_BIN   = "/home/admin/regolancer-orchestrator/regolancer"
 TEMPLATE_FILE    = "/home/admin/regolancer-orchestrator/config.template.json"
@@ -49,6 +52,7 @@ LAST_REPORT_FILE = "/home/admin/regolancer-orchestrator/last_report_date.txt"
 LAST_REPORT_ERROR_FILE = "/home/admin/regolancer-orchestrator/last_report_error_date.txt"
 SUCCESS_REBAL_FILE = "/home/admin/regolancer-orchestrator/success-rebal.csv"
 SUCCESS_STATE_FILE = "/home/admin/regolancer-orchestrator/last_success_offset.txt"
+ERROR_LOG_FILE = "/home/admin/regolancer-orchestrator/errors.log"
 
 # =========================
 # TELEGRAM
@@ -135,7 +139,8 @@ def run_regolancer(worker_id, pair, amount, pair_id):
         f"[pto={pair['pto']}%]"
     )
 
-    log_pair(worker_id, src, tgt, amount, prefix=prefix)
+    if LOG_OPERATIONAL:
+        log_pair(worker_id, src, tgt, amount, prefix=prefix)
 
     with tempfile.NamedTemporaryFile("w", suffix=".json") as tmp:
         json.dump(cfg, tmp, indent=2)
@@ -178,27 +183,53 @@ def worker_loop(worker_id):
     print(f"[W{worker_id}] Worker started")
 
     while RUN_FOREVER:
+        cycle_start = time.monotonic()
+
         try:
             amount, state = advance_cycle_and_get_amount()
 
             channels = asyncio.run(load_channels())
             pairs = build_pairs(channels)
 
+            if pairs and RANDOMIZE_PAIRS:
+                random.shuffle(pairs)
+
             pair_counter = 0  # 🔁 RESET A CADA CICLO
 
             if pairs:
                 for pair in pairs:
+                    elapsed = time.monotonic() - cycle_start
+
+                    # ⏱️ TIMEOUT DO CICLO
+                    if elapsed > MAX_CYCLE_SECONDS:
+                        src_alias = pair.get("source", {}).get("alias", "?")
+                        tgt_alias = pair.get("target", {}).get("alias", "?")
+
+                        msg = (
+                            f"[W{worker_id}] CYCLE TIMEOUT: "
+                            f"elapsed={int(elapsed)}s max={MAX_CYCLE_SECONDS}s "
+                            f"(cycle={state['cycle']}, pair=SRC {src_alias} → TGT {tgt_alias})"
+                        )
+
+                        print(f"[W{worker_id}] ⚠️ {msg}, restarting cycle")
+                        #log_error(msg)
+                        break
+
                     pair_counter += 1
                     run_regolancer(worker_id, pair, amount, pair_counter)
 
+            total = int(time.monotonic() - cycle_start)
+
             print(
                 f"[W{worker_id}] === CYCLE FINISHED "
-                f"(cycle={state['cycle']} amount={amount}) — sleeping {SLEEP_SECONDS}s ==="
+                f"(cycle={state['cycle']} amount={amount} duration={total}s) "
+                f"— sleeping {SLEEP_SECONDS}s ==="
             )
-
         except Exception:
+            err = traceback.format_exc()
             print(f"[W{worker_id}] ERROR")
-            traceback.print_exc()
+            print(err)
+            log_error(f"[W{worker_id}] Unhandled exception:\n{err}")
 
         time.sleep(SLEEP_SECONDS)
 
@@ -263,8 +294,10 @@ def telegram_notifier_loop():
                     send_telegram(msg)
 
         except Exception:
-            print("[TELEGRAM] ERROR")
-            traceback.print_exc()
+            err = traceback.format_exc()
+            print(f"[TELEGRAM] ERROR")
+            print(err)
+            log_error(f"[W{worker_id}] Unhandled exception:\n{err}")
 
         time.sleep(30)
 
@@ -359,6 +392,7 @@ def maybe_run_daily_report():
                 f"STDERR:\n{stderr[:350]}\n\n"
                 f"STDOUT:\n{stdout[:350]}"
             )
+            log_error(msg)
             send_telegram(msg)
             write_last_report_error_date(today_str)
 
@@ -375,6 +409,20 @@ def scheduler_loop():
             traceback.print_exc()
 
         time.sleep(30)  # checa a cada 30s
+
+_error_log_lock = threading.Lock()
+
+def log_error(msg: str):
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    line = f"[{timestamp}] {msg}\n"
+
+    try:
+        with _error_log_lock:
+            with open(ERROR_LOG_FILE, "a") as f:
+                f.write(line)
+    except Exception:
+        # último recurso: não deixa crashar por erro de log
+        pass
 
 # =========================
 # MAIN
