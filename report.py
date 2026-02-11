@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import csv
 import os
 import requests
@@ -30,6 +32,9 @@ START_DATE = TODAY - timedelta(days=DAYS_BACK)
 LNDG_BASE_URL = os.getenv("LNDG_BASE_URL", "http://localhost:8889").rstrip("/")
 LNDG_USER = os.getenv("LNDG_USER")
 LNDG_PASS = os.getenv("LNDG_PASS")
+
+# LOS (LightningOS)
+LOS_BASE_URL = os.getenv("LOS_BASE_URL", "https://localhost:8443").rstrip("/")
 
 # Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -208,6 +213,51 @@ def load_regolancer_rebalances():
     return daily
 
 # =========================
+# LOS REBALANCES
+# =========================
+
+def fetch_los_rebalances():
+    daily = defaultdict(int)
+
+    url = f"{LOS_BASE_URL}/api/rebalance/history"
+
+    log("Starting LOS rebalances fetch")
+
+    try:
+        r = requests.get(url, verify=False, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log(f"LOS fetch error: {e}")
+        return daily
+
+    month_start = TODAY.replace(day=1)
+
+    processed = 0
+
+    for at in data.get("attempts", []):
+        try:
+            if at.get("status") != "succeeded":
+                continue
+
+            d = datetime.fromisoformat(
+                at["finished_at"].replace("Z", "+00:00")
+            ).date()
+
+            if d < month_start or d > TODAY:
+                continue
+
+            processed += 1
+            daily[d] += int(at.get("amount_sat", 0))
+
+        except Exception:
+            continue
+
+    log(f"LOS processed (month rebuild) = {processed}")
+
+    return daily
+
+# =========================
 # LNDg FORWARDS (VOLUME)
 # =========================
 
@@ -286,6 +336,7 @@ def save_daily_report(daily):
             "date",
             "lndg_sats",
             "regolancer_sats",
+            "los_sats",
             "forwards_sats",
         ])
 
@@ -295,8 +346,10 @@ def save_daily_report(daily):
                 d.isoformat(),
                 daily.get(d, {}).get("lndg", 0),
                 daily.get(d, {}).get("rego", 0),
+                daily.get(d, {}).get("los", 0),
                 daily.get(d, {}).get("fw_sats", 0),
             ])
+
             d += timedelta(days=1)
 
     log("daily-report.csv written successfully")
@@ -315,11 +368,14 @@ def build_telegram_message(daily):
     fw_today = today.get("fw_sats", 0)
     lndg_today = today.get("lndg", 0)
     rego_today = today.get("rego", 0)
-    rebals_today = lndg_today + rego_today
+    los_today = today.get("los", 0)
+
+    rebals_today = lndg_today + rego_today + los_today
 
     msg += (
         f"💰 Forwards Hoje: {fw_today:,}\n"
         f"☯️ Rebals Hoje: {rebals_today:,}\n"
+        f"☯️ LOS: {los_today:,} ({pct(los_today, rebals_today):.2f}%)\n"
         f"☯️ LNDg: {lndg_today:,} ({pct(lndg_today, rebals_today):.2f}%)\n"
         f"☯️ Rego-Orchestrator: {rego_today:,} ({pct(rego_today, rebals_today):.2f}%)\n\n"
     )
@@ -330,12 +386,14 @@ def build_telegram_message(daily):
     fw_month = sum(v.get("fw_sats", 0) for d, v in daily.items() if d >= month_start)
     lndg_month = sum(v.get("lndg", 0) for d, v in daily.items() if d >= month_start)
     rego_month = sum(v.get("rego", 0) for d, v in daily.items() if d >= month_start)
-    rebals_month = lndg_month + rego_month
+    los_month = sum(v.get("los", 0) for d, v in daily.items() if d >= month_start)
+    rebals_month = lndg_month + rego_month + los_month
 
     msg += (
         "📊 *Mês Atual*\n\n"
         f"💰 Total Forwards: {fw_month:,}\n"
         f"☯️ Total Rebals: {rebals_month:,}\n"
+        f"☯️ LOS: {los_month:,} ({pct(los_month, rebals_month):.2f}%)\n"
         f"☯️ LNDg: {lndg_month:,} ({pct(lndg_month, rebals_month):.2f}%)\n"
         f"☯️ Rego-Orchestrator: {rego_month:,} ({pct(rego_month, rebals_month):.2f}%)\n\n"
     )
@@ -350,14 +408,17 @@ def build_telegram_message(daily):
         fw_m = sum(v.get("fw_sats", 0) for d, v in daily.items() if d.year == year and d.month == month)
         lndg_m = sum(v.get("lndg", 0) for d, v in daily.items() if d.year == year and d.month == month)
         rego_m = sum(v.get("rego", 0) for d, v in daily.items() if d.year == year and d.month == month)
-        rebals_m = lndg_m + rego_m
+        los_m = sum(v.get("los", 0) for d, v in daily.items() if d.year == year and d.month == month)
+
+        rebals_m = lndg_m + rego_m + los_m
 
         msg += (
             f"🗓️ *{m.strftime('%B')}*:\n"
             f"💰 Forwards {fw_m:,}\n"
-            f"☯️ Rebals {rebals_m:,}\n"
-            f"☯️ (LNDg {pct(lndg_m, rebals_m):.2f}% / "
-            f"Rego-Orch {pct(rego_m, rebals_m):.2f}%)\n\n"
+            f"☯️ Rebals Total {rebals_m:,}\n"
+            f"☯️ LOS {pct(los_m, rebals_m):.2f}%\n"
+            f"☯️ LNDg {pct(lndg_m, rebals_m):.2f}%\n"
+            f"☯️ Rego-Orch {pct(rego_m, rebals_m):.2f}%\n\n"
         )
 
     return msg
@@ -393,6 +454,11 @@ def main():
     rego = load_regolancer_rebalances()
     lndg = fetch_lndg_rebalances(skip_days)
     fw = fetch_lndg_forwards(skip_days)
+
+    los = fetch_los_rebalances()
+
+    for d, amt in los.items():
+        daily.setdefault(d, {})["los"] = amt
 
     for d, amt in lndg.items():
         daily.setdefault(d, {})["lndg"] = amt

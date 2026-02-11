@@ -13,6 +13,8 @@ amount_state.json
 # Logs
 logs/
 *.log
+# Telegram
+telegram/
 # Environment / secrets / config
 .env
 config.template.json

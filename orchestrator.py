@@ -10,6 +10,8 @@ import threading
 import sys
 import random
 sys.stdout.reconfigure(line_buffering=True)
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from datetime import datetime
 from dotenv import load_dotenv
 from lndg_api import load_channels
@@ -32,27 +34,73 @@ def env_bool(name: str, default: bool = False) -> bool:
 # CONFIG (ENV)
 # =========================
 
-LOG_OPERATIONAL = env_bool("LOG_OPERATIONAL", False)
-RUN_FOREVER       = env_bool("RUN_FOREVER", True)
-SLEEP_SECONDS     = int(os.getenv("SLEEP_SECONDS", "5"))
-MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "1"))
-ENABLE_FILE_LOGS  = env_bool("ENABLE_FILE_LOGS", False)
-DRY_RUN               = env_bool("DRY_RUN", True)
-REGOLANCER_LIVE_LOGS  = env_bool("REGOLANCER_LIVE_LOGS", True)
-LOG_TEMPLATE_CONFIG   = env_bool("LOG_TEMPLATE_CONFIG", False)
-SEND_REBALANCE_MSG    = env_bool("SEND_REBALANCE_MSG", True)
-MAX_CYCLE_SECONDS = int(os.getenv("MAX_CYCLE_SECONDS", "300"))
-RANDOMIZE_PAIRS = env_bool("RANDOMIZE_PAIRS", True)
+# ------------------------------------------------------------
+# GENERAL EXECUTION
+# ------------------------------------------------------------
+LOG_OPERATIONAL      = env_bool("LOG_OPERATIONAL", False)
+RUN_FOREVER          = env_bool("RUN_FOREVER", True)
+SLEEP_SECONDS        = int(os.getenv("SLEEP_SECONDS", "5"))
+MAX_WORKERS          = int(os.getenv("MAX_WORKERS", "1"))
+MAX_CYCLE_SECONDS    = int(os.getenv("MAX_CYCLE_SECONDS", "300"))
+RANDOMIZE_PAIRS      = env_bool("RANDOMIZE_PAIRS", True)
+ENABLE_FILE_LOGS     = env_bool("ENABLE_FILE_LOGS", False)
 
+DRY_RUN              = env_bool("DRY_RUN", True)
+REGOLANCER_LIVE_LOGS = env_bool("REGOLANCER_LIVE_LOGS", True)
+LOG_TEMPLATE_CONFIG  = env_bool("LOG_TEMPLATE_CONFIG", False)
+
+SYNC_LOS_TO_LNDG     = env_bool("SYNC_LOS_TO_LNDG", False)
+
+
+# ------------------------------------------------------------
+# TELEGRAM — REBALANCE NOTIFICATIONS
+# ------------------------------------------------------------
+SEND_REBALANCE_MSG_REGO_ORCH = env_bool("SEND_REBALANCE_MSG_REGO_ORCH", True)
+SEND_REBALANCE_MSG_LNDG      = env_bool("SEND_REBALANCE_MSG_LNDG", True)
+SEND_REBALANCE_MSG_LOS       = env_bool("SEND_REBALANCE_MSG_LOS", True)
+
+
+# ------------------------------------------------------------
+# LNDg CONFIG
+# ------------------------------------------------------------
+LNDG_BASE_URL = os.getenv("LNDG_BASE_URL", "http://localhost:8889").rstrip("/")
+LNDG_USER     = os.getenv("LNDG_USER")
+LNDG_PASS     = os.getenv("LNDG_PASS")
+
+
+# ------------------------------------------------------------
+# LOS CONFIG
+# ------------------------------------------------------------
+LOS_BASE_URL  = os.getenv("LOS_BASE_URL", "https://localhost:8443").rstrip("/")
+LOS_VERIFY_TLS = os.getenv("LOS_VERIFY_TLS", "false").lower() == "true"
+
+
+# ------------------------------------------------------------
+# TELEGRAM STATE DIRECTORY
+# ------------------------------------------------------------
+TELEGRAM_STATE_DIR = "/home/admin/regolancer-orchestrator/telegram"
+os.makedirs(TELEGRAM_STATE_DIR, exist_ok=True)
+
+REGO_STATE_FILE = os.path.join(TELEGRAM_STATE_DIR, "last_rego_offset.txt")
+LNDG_STATE_FILE = os.path.join(TELEGRAM_STATE_DIR, "last_lndg_id.txt")
+LOS_STATE_FILE  = os.path.join(TELEGRAM_STATE_DIR, "last_los_id.txt")
+
+
+# ------------------------------------------------------------
+# SYSTEM PATHS
+# ------------------------------------------------------------
 REGOLANCER_BIN   = "/home/admin/regolancer-orchestrator/regolancer"
 TEMPLATE_FILE    = "/home/admin/regolancer-orchestrator/config.template.json"
 REPORT_PY        = "/home/admin/regolancer-orchestrator/report.py"
-AMOUNT_STATE_FILE = "/home/admin/regolancer-orchestrator/amount_state.json"
-LAST_REPORT_FILE = "/home/admin/regolancer-orchestrator/last_report_date.txt"
-LAST_REPORT_ERROR_FILE = "/home/admin/regolancer-orchestrator/last_report_error_date.txt"
-SUCCESS_REBAL_FILE = "/home/admin/regolancer-orchestrator/success-rebal.csv"
-SUCCESS_STATE_FILE = "/home/admin/regolancer-orchestrator/last_success_offset.txt"
-ERROR_LOG_FILE = "/home/admin/regolancer-orchestrator/errors.log"
+
+AMOUNT_STATE_FILE          = "/home/admin/regolancer-orchestrator/amount_state.json"
+LAST_REPORT_FILE           = "/home/admin/regolancer-orchestrator/last_report_date.txt"
+LAST_REPORT_ERROR_FILE     = "/home/admin/regolancer-orchestrator/last_report_error_date.txt"
+
+SUCCESS_REBAL_FILE         = "/home/admin/regolancer-orchestrator/success-rebal.csv"
+ERROR_LOG_FILE             = "/home/admin/regolancer-orchestrator/errors.log"
+
+SYNC_SCRIPT_PATH           = "/home/admin/regolancer-orchestrator/sync_los_to_lndg.sh"
 
 # =========================
 # TELEGRAM
@@ -238,14 +286,15 @@ def worker_loop(worker_id):
 # =========================
 
 def read_new_rebalances():
-    last_offset = 0
+    # FIRST RUN → não enviar histórico
+    if not os.path.exists(REGO_STATE_FILE):
+        if os.path.exists(SUCCESS_REBAL_FILE):
+            with open(SUCCESS_REBAL_FILE, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                write_last_id(REGO_STATE_FILE, f.tell())
+        return []
 
-    if os.path.exists(SUCCESS_STATE_FILE):
-        with open(SUCCESS_STATE_FILE, "r") as f:
-            try:
-                last_offset = int(f.read().strip())
-            except ValueError:
-                last_offset = 0
+    last_offset = read_last_id(REGO_STATE_FILE)
 
     if not os.path.exists(SUCCESS_REBAL_FILE):
         return []
@@ -261,8 +310,7 @@ def read_new_rebalances():
 
         new_offset = f.tell()
 
-    with open(SUCCESS_STATE_FILE, "w") as f:
-        f.write(str(new_offset))
+    write_last_id(REGO_STATE_FILE, new_offset)
 
     return new_lines
 
@@ -270,36 +318,166 @@ def read_new_rebalances():
 # MESSAGE
 # =========================
 
-def format_rebalance_msg(csv_line):
-    try:
-        parts = csv_line.split(",")
-        amount_msat = int(parts[3])
-        amount_sat = amount_msat // 1000
-        amount_fmt = f"{amount_sat:,}"
-    except Exception:
-        amount_fmt = "?"
-
-    return f"☯️ ⚡ {amount_fmt} by Regolancer-Orchestrator"
-
 def telegram_notifier_loop():
     print("[TELEGRAM] notifier started")
 
     while True:
         try:
-            new_rebalances = read_new_rebalances()
+            # ---------------------------
+            # Regolancer-Orchestrator
+            # ---------------------------
+            if SEND_REBALANCE_MSG_REGO_ORCH:
+                new_rebalances = read_new_rebalances()
 
-            for line in new_rebalances:
-                if SEND_REBALANCE_MSG:
-                    msg = format_rebalance_msg(line)
-                    send_telegram(msg)
+                for line in new_rebalances:
+                    try:
+                        parts = line.split(",")
+                        amount_msat = int(parts[3])
+                        amount_sat = amount_msat // 1000
+                        msg = format_rebalance_source_msg(
+                            amount_sat,
+                            "Regolancer-Orchestrator"
+                        )
+                        send_telegram(msg)
+                    except Exception:
+                        continue
+
+            # ---------------------------
+            # LNDg
+            # ---------------------------
+            lndg_events = read_new_lndg_rebalances()
+
+            for rb_id, amount in lndg_events:
+                msg = format_rebalance_source_msg(amount, "LNDg")
+                send_telegram(msg)
+
+            # ---------------------------
+            # LOS
+            # ---------------------------
+            los_events = read_new_los_rebalances()
+
+            for at_id, amount in los_events:
+                msg = format_rebalance_source_msg(amount, "LOS")
+                send_telegram(msg)
 
         except Exception:
             err = traceback.format_exc()
-            print(f"[TELEGRAM] ERROR")
+            print("[TELEGRAM] ERROR")
             print(err)
-            log_error(f"[W{worker_id}] Unhandled exception:\n{err}")
+            log_error(f"[TELEGRAM] Unhandled exception:\n{err}")
 
         time.sleep(30)
+
+def format_rebalance_source_msg(amount_sat: int, source: str) -> str:
+    return f"☯️ ⚡ {amount_sat:,} by {source}"
+
+def read_last_id(path):
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+
+def write_last_id(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+    except Exception:
+        pass
+
+def read_new_lndg_rebalances():
+    if not SEND_REBALANCE_MSG_LNDG:
+        return []
+
+    try:
+        r = requests.get(
+            f"{LNDG_BASE_URL}/api/rebalancer/?status=2&limit=50",
+            auth=(LNDG_USER, LNDG_PASS),
+            timeout=10
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return []
+
+    results = data.get("results", [])
+
+    # FIRST RUN → salvar maior ID e sair
+    if not os.path.exists(LNDG_STATE_FILE):
+        if results:
+            max_id = max(rb.get("id", 0) for rb in results)
+            write_last_id(LNDG_STATE_FILE, max_id)
+        return []
+
+    last_id = read_last_id(LNDG_STATE_FILE)
+
+    new_events = []
+    max_id_seen = last_id
+
+    for rb in results:
+        rb_id = rb.get("id", 0)
+
+        if rb_id > last_id:
+            amount = int(rb.get("value", 0))
+            new_events.append((rb_id, amount))
+
+        if rb_id > max_id_seen:
+            max_id_seen = rb_id
+
+    if max_id_seen > last_id:
+        write_last_id(LNDG_STATE_FILE, max_id_seen)
+
+    return new_events
+
+def read_new_los_rebalances():
+    if not SEND_REBALANCE_MSG_LOS:
+        return []
+
+    try:
+        r = requests.get(
+            f"{LOS_BASE_URL}/api/rebalance/history",
+            verify=LOS_VERIFY_TLS,
+            timeout=15
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return []
+
+    attempts = [
+        at for at in data.get("attempts", [])
+        if at.get("status") == "succeeded"
+    ]
+
+    # FIRST RUN → salvar maior ID e sair
+    if not os.path.exists(LOS_STATE_FILE):
+        if attempts:
+            max_id = max(at.get("id", 0) for at in attempts)
+            write_last_id(LOS_STATE_FILE, max_id)
+        return []
+
+    last_id = read_last_id(LOS_STATE_FILE)
+
+    new_events = []
+    max_id_seen = last_id
+
+    for at in attempts:
+        at_id = at.get("id", 0)
+
+        if at_id > last_id:
+            amount = int(at.get("amount_sat", 0))
+            new_events.append((at_id, amount))
+
+        if at_id > max_id_seen:
+            max_id_seen = at_id
+
+    if max_id_seen > last_id:
+        write_last_id(LOS_STATE_FILE, max_id_seen)
+
+    return new_events
 
 # =========================
 # DAILY REPORT (23:59)
@@ -424,6 +602,31 @@ def log_error(msg: str):
         # último recurso: não deixa crashar por erro de log
         pass
 
+def los_sync_loop():
+    if not SYNC_LOS_TO_LNDG:
+        print("[LOS-SYNC] Disabled")
+        return
+
+    print("[LOS-SYNC] Sync loop started (interval=60s)")
+
+    while True:
+        try:
+            #print("[LOS-SYNC] Running sync_los_to_lndg.sh")
+
+            subprocess.run(
+                [SYNC_SCRIPT_PATH],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+        except Exception as e:
+            err = f"[LOS-SYNC] ERROR: {e}"
+            print(err)
+            log_error(err)
+
+        time.sleep(60)
+
 # =========================
 # MAIN
 # =========================
@@ -450,6 +653,13 @@ if __name__ == "__main__":
         target=scheduler_loop,
         daemon=True
     ).start()
+
+    # LOS → LNDg sync loop
+    threading.Thread(
+        target=los_sync_loop,
+        daemon=True
+    ).start()
+
 
     # keep main alive
     while True:
