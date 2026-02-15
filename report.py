@@ -11,6 +11,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from zoneinfo import ZoneInfo
 
 _session = None
 load_dotenv()
@@ -25,7 +26,8 @@ DAILY_REPORT_CSV = f"{BASE_DIR}/daily-report.csv"
 SUCCESS_REBAL_CSV = f"{BASE_DIR}/success-rebal.csv"
 
 DAYS_BACK = 365
-TODAY = date.today()
+TZ = ZoneInfo("America/Sao_Paulo")
+TODAY = datetime.now(TZ).date()
 START_DATE = TODAY - timedelta(days=DAYS_BACK)
 
 # LNDg
@@ -144,9 +146,20 @@ def fetch_lndg_rebalances(skip_days):
         for rb in data.get("results", []):
             try:
                 completed = rb.get("stop") or rb.get("requested")
-                d = datetime.fromisoformat(
+                if not completed:
+                    continue
+
+                # 🔥 Parse robusto de timestamp
+                dt = datetime.fromisoformat(
                     completed.replace("Z", "+00:00")
-                ).date()
+                )
+
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+
+                dt_br = dt.astimezone(TZ)
+                d = dt_br.date()
+
             except Exception:
                 continue
 
@@ -242,7 +255,7 @@ def fetch_los_rebalances():
 
             d = datetime.fromisoformat(
                 at["finished_at"].replace("Z", "+00:00")
-            ).date()
+            ).astimezone(TZ).date()
 
             if d < month_start or d > TODAY:
                 continue
@@ -279,16 +292,26 @@ def fetch_lndg_forwards(skip_days):
 
         for fw in data.get("results", []):
             try:
-                # forward_date vem em ISO8601
-                d = datetime.fromisoformat(
-                    fw["forward_date"]
-                ).date()
+                raw_ts = fw.get("forward_date")
+                if not raw_ts:
+                    continue
+
+                # 🔥 Parse robusto de timestamp
+                dt = datetime.fromisoformat(
+                    raw_ts.replace("Z", "+00:00")
+                )
+
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+
+                dt_br = dt.astimezone(TZ)
+                d = dt_br.date()
+
             except Exception:
                 continue
 
             oldest_date = d if oldest_date is None else min(oldest_date, d)
 
-            # fora da janela histórica
             if d < START_DATE:
                 log("Reached forwards older than DAYS_BACK → stopping")
                 return daily
@@ -298,12 +321,10 @@ def fetch_lndg_forwards(skip_days):
 
             processed += 1
 
-            # dia já consolidado
             if d in skip_days:
                 skipped_existing += 1
                 continue
 
-            # msat → sat
             daily[d] += int(fw.get("amt_out_msat", 0)) // 1000
 
         log(
@@ -314,7 +335,6 @@ def fetch_lndg_forwards(skip_days):
 
         time.sleep(0.3)
 
-        # early stop inteligente
         if processed > 0 and processed == skipped_existing:
             log("All forwards in this page already processed → stopping early")
             break
@@ -359,11 +379,12 @@ def save_daily_report(daily):
 # =========================
 
 def build_telegram_message(daily):
-    msg = (
-        "📊 *regolancer-orchestrator*\n\n"
-    )
+    msg = "📊 *regolancer-orchestrator*\n\n"
 
+    # =========================
     # HOJE
+    # =========================
+
     today = daily.get(TODAY, {})
     fw_today = today.get("fw_sats", 0)
     lndg_today = today.get("lndg", 0)
@@ -373,6 +394,7 @@ def build_telegram_message(daily):
     rebals_today = lndg_today + rego_today + los_today
 
     msg += (
+        f"🗓️ *{TODAY.strftime('%d/%m/%Y')}*:\n"
         f"💰 Forwards Hoje: {fw_today:,}\n"
         f"☯️ Rebals Hoje: {rebals_today:,}\n"
         f"☯️ LOS: {los_today:,} ({pct(los_today, rebals_today):.2f}%)\n"
@@ -380,17 +402,22 @@ def build_telegram_message(daily):
         f"☯️ Rego-Orchestrator: {rego_today:,} ({pct(rego_today, rebals_today):.2f}%)\n\n"
     )
 
+    # =========================
     # MÊS ATUAL
+    # =========================
+
     month_start = TODAY.replace(day=1)
+    month_name = TODAY.strftime("%B").capitalize()
 
     fw_month = sum(v.get("fw_sats", 0) for d, v in daily.items() if d >= month_start)
     lndg_month = sum(v.get("lndg", 0) for d, v in daily.items() if d >= month_start)
     rego_month = sum(v.get("rego", 0) for d, v in daily.items() if d >= month_start)
     los_month = sum(v.get("los", 0) for d, v in daily.items() if d >= month_start)
+
     rebals_month = lndg_month + rego_month + los_month
 
     msg += (
-        "📊 *Mês Atual*\n\n"
+        f"📊 *Mês Atual - {month_name}*\n\n"
         f"💰 Total Forwards: {fw_month:,}\n"
         f"☯️ Total Rebals: {rebals_month:,}\n"
         f"☯️ LOS: {los_month:,} ({pct(los_month, rebals_month):.2f}%)\n"
@@ -398,7 +425,10 @@ def build_telegram_message(daily):
         f"☯️ Rego-Orchestrator: {rego_month:,} ({pct(rego_month, rebals_month):.2f}%)\n\n"
     )
 
+    # =========================
     # HISTÓRICO 12M
+    # =========================
+
     msg += "📊 *Histórico 12m*\n\n"
 
     for i in range(11, -1, -1):
@@ -448,8 +478,25 @@ def main():
 
     log("=== REPORT START ===")
 
+    # 🔍 TIME DEBUG
+    log("=== TIME DEBUG ===")
+    log(f"datetime.now() (naive system): {datetime.now()}")
+    log(f"datetime.now(TZ): {datetime.now(TZ)}")
+    log(f"TODAY (BR): {TODAY}")
+
+    START_OF_DAY = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    NOW_BR = datetime.now(TZ)
+
+    log(f"START_OF_DAY (BR): {START_OF_DAY}")
+    log(f"NOW_BR: {NOW_BR}")
+    log("===================")
+
     daily = load_existing_report()
-    skip_days = set(daily.keys())
+
+    # 🔥 Força reset do dia atual
+    daily[TODAY] = {}
+
+    skip_days = {d for d in daily.keys() if d != TODAY}
 
     rego = load_regolancer_rebalances()
     lndg = fetch_lndg_rebalances(skip_days)
