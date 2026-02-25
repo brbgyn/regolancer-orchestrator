@@ -30,6 +30,8 @@ TZ = ZoneInfo("America/Sao_Paulo")
 TODAY = datetime.now(TZ).date()
 START_DATE = TODAY - timedelta(days=DAYS_BACK)
 
+FREEZE_AFTER_MINUTE = 5
+
 # LNDg
 LNDG_BASE_URL = os.getenv("LNDG_BASE_URL", "http://localhost:8889").rstrip("/")
 LNDG_USER = os.getenv("LNDG_USER")
@@ -115,6 +117,7 @@ def load_existing_report():
                 daily[d] = {
                     "lndg": int(r.get("lndg_sats", 0)),
                     "rego": int(r.get("regolancer_sats", 0)),
+                    "los": int(r.get("los_sats", 0)),
                     "fw_sats": int(r.get("forwards_sats", 0)),
                 }
             except Exception:
@@ -229,7 +232,7 @@ def load_regolancer_rebalances():
 # LOS REBALANCES
 # =========================
 
-def fetch_los_rebalances():
+def fetch_los_rebalances(skip_days):
     daily = defaultdict(int)
 
     url = f"{LOS_BASE_URL}/api/rebalance/history"
@@ -244,29 +247,27 @@ def fetch_los_rebalances():
         log(f"LOS fetch error: {e}")
         return daily
 
-    month_start = TODAY.replace(day=1)
-
-    processed = 0
-
     for at in data.get("attempts", []):
         try:
             if at.get("status") != "succeeded":
                 continue
 
-            d = datetime.fromisoformat(
+            dt = datetime.fromisoformat(
                 at["finished_at"].replace("Z", "+00:00")
-            ).astimezone(TZ).date()
+            ).astimezone(TZ)
 
-            if d < month_start or d > TODAY:
+            d = dt.date()
+
+            if d < START_DATE or d > TODAY:
                 continue
 
-            processed += 1
+            if d in skip_days:
+                continue
+
             daily[d] += int(at.get("amount_sat", 0))
 
         except Exception:
             continue
-
-    log(f"LOS processed (month rebuild) = {processed}")
 
     return daily
 
@@ -348,31 +349,45 @@ def fetch_lndg_forwards(skip_days):
 # =========================
 
 def save_daily_report(daily):
-    log("Writing daily-report.csv")
+    log("Updating daily-report.csv safely")
 
+    existing = {}
+
+    if os.path.exists(DAILY_REPORT_CSV):
+        with open(DAILY_REPORT_CSV) as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                existing[r["date"]] = r
+
+    # Atualiza apenas o dia atual
+    today_str = TODAY.isoformat()
+
+    existing[today_str] = {
+        "date": today_str,
+        "lndg_sats": daily.get(TODAY, {}).get("lndg", 0),
+        "regolancer_sats": daily.get(TODAY, {}).get("rego", 0),
+        "los_sats": daily.get(TODAY, {}).get("los", 0),
+        "forwards_sats": daily.get(TODAY, {}).get("fw_sats", 0),
+    }
+
+    # Escreve tudo preservando histórico intacto
     with open(DAILY_REPORT_CSV, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "date",
-            "lndg_sats",
-            "regolancer_sats",
-            "los_sats",
-            "forwards_sats",
-        ])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "date",
+                "lndg_sats",
+                "regolancer_sats",
+                "los_sats",
+                "forwards_sats",
+            ],
+        )
+        writer.writeheader()
 
-        d = START_DATE
-        while d <= TODAY:
-            writer.writerow([
-                d.isoformat(),
-                daily.get(d, {}).get("lndg", 0),
-                daily.get(d, {}).get("rego", 0),
-                daily.get(d, {}).get("los", 0),
-                daily.get(d, {}).get("fw_sats", 0),
-            ])
+        for date_str in sorted(existing.keys()):
+            writer.writerow(existing[date_str])
 
-            d += timedelta(days=1)
-
-    log("daily-report.csv written successfully")
+    log("daily-report.csv updated safely")
 
 # =========================
 # TELEGRAM MESSAGE
@@ -491,18 +506,32 @@ def main():
     log(f"NOW_BR: {NOW_BR}")
     log("===================")
 
+    now_br = datetime.now(TZ)
+    freeze_cutoff = now_br.replace(hour=0, minute=FREEZE_AFTER_MINUTE, second=0, microsecond=0)
+
+    yesterday = TODAY - timedelta(days=1)
+
+    freeze_yesterday = now_br >= freeze_cutoff
+
     daily = load_existing_report()
 
-    # 🔥 Força reset do dia atual
-    daily[TODAY] = {}
+    # Rebuild do dia atual
+    daily[TODAY] = daily.get(TODAY, {}).copy()
 
-    skip_days = {d for d in daily.keys() if d != TODAY}
+    skip_days = set()
+
+    for d in daily.keys():
+        if d == TODAY:
+            continue
+        if d == yesterday and not freeze_yesterday:
+            continue  # ainda pode recalcular ontem antes do freeze
+        skip_days.add(d)
 
     rego = load_regolancer_rebalances()
     lndg = fetch_lndg_rebalances(skip_days)
     fw = fetch_lndg_forwards(skip_days)
 
-    los = fetch_los_rebalances()
+    los = fetch_los_rebalances(skip_days)
 
     for d, amt in los.items():
         daily.setdefault(d, {})["los"] = amt
@@ -516,9 +545,38 @@ def main():
     for d, amt in fw.items():
         daily.setdefault(d, {})["fw_sats"] = amt
 
+    previous_daily = load_existing_report()
+
+    for d, old_values in previous_daily.items():
+
+        # Se o dia inteiro sumiu, restaura
+        if d not in daily:
+            log(f"🔒 Restoring missing day {d}")
+            daily[d] = old_values.copy()
+            continue
+
+        for key in ["los", "lndg", "rego", "fw_sats"]:
+            old_val = old_values.get(key, 0)
+            new_val = daily[d].get(key, None)
+
+            # 🔹 Caso 1: chave sumiu
+            if new_val is None:
+                log(f"🔒 Restoring missing key {key} for {d}")
+                daily[d][key] = old_val
+                continue
+
+            # 🔹 Caso 2: valor zerou suspeitamente
+            if old_val > 0 and new_val == 0:
+                log(f"🚨 Sanity check triggered for {d} ({key}) → keeping old value {old_val}")
+                daily[d][key] = old_val
+
     save_daily_report(daily)
 
+    # 🔥 Recarrega o CSV consolidado
+    daily = load_existing_report()
+
     msg = build_telegram_message(daily)
+
     print("\n" + msg + "\n")
     send_telegram(msg)
 
