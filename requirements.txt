@@ -1,3 +1,4 @@
 aiohttp
 requests
 python-dotenv
+python-dateutil

@@ -444,10 +444,12 @@ def build_telegram_message(daily):
     # HISTÓRICO 12M
     # =========================
 
+    from dateutil.relativedelta import relativedelta
+
     msg += "📊 *Histórico 12m*\n\n"
 
     for i in range(11, -1, -1):
-        m = (TODAY.replace(day=1) - timedelta(days=30 * i))
+        m = TODAY.replace(day=1) - relativedelta(months=i)
         year, month = m.year, m.month
 
         fw_m = sum(v.get("fw_sats", 0) for d, v in daily.items() if d.year == year and d.month == month)
